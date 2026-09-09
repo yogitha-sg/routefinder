@@ -3,18 +3,21 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 
-import '../models/road_segment.dart';
 import '../services/risk_service.dart';
 import '../services/weather_service.dart';
 import '../services/route_service.dart';
 import '../services/location_service.dart';
+import '../models/road_segment.dart';
 
 class MapScreen extends StatefulWidget {
   final String travelMode;
 
+  final bool selectionMode;
+
   const MapScreen({
     super.key,
     required this.travelMode,
+    this.selectionMode = false,
   });
 
   @override
@@ -22,112 +25,61 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
-  // ============================================================
-  // MAP CONTROLLER
-  // ============================================================
-
   final MapController mapController = MapController();
 
   // ============================================================
-  // WEATHER VARIABLES
-  // ============================================================
-
-  double rainfall = 0;
-
-  bool isLoadingWeather = true;
-
-  String weatherError = '';
-
-  // ============================================================
-  // LOCATION VARIABLES
+  // LOCATION
   // ============================================================
 
   Position? currentPosition;
+
+  LatLng? destination;
 
   bool isLoadingLocation = false;
 
   String locationError = '';
 
   // ============================================================
-  // ROAD VARIABLES
+  // WEATHER
   // ============================================================
 
-  late List<RoadSegment> roads;
+  double rainfall = 0;
 
-  RoadSegment? recommendedRoad;
+  bool isLoadingWeather = true;
 
   // ============================================================
-  // INIT STATE
+  // ROUTING
+  // ============================================================
+
+  List<RouteOption> routes = [];
+
+  RouteOption? safestRoute;
+
+  int selectedRouteIndex = 0;
+
+  bool isLoadingRoutes = false;
+
+  bool routeCalculated = false;
+
+  String routeError = '';
+
+  // ============================================================
+  // INIT
   // ============================================================
 
   @override
   void initState() {
     super.initState();
 
-    // Chennai road segments
-    roads = [
-      RoadSegment(
-        name: 'Velachery Main Road',
-        elevation: 2.1,
-        drainageDistance: 180,
-        points: [
-          LatLng(12.9815, 80.2180),
-          LatLng(12.9875, 80.2200),
-          LatLng(12.9940, 80.2230),
-        ],
-      ),
-
-      RoadSegment(
-        name: 'Mudichur Link',
-        elevation: 1.8,
-        drainageDistance: 190,
-        points: [
-          LatLng(12.9250, 80.1050),
-          LatLng(12.9300, 80.1120),
-          LatLng(12.9380, 80.1200),
-        ],
-      ),
-
-      RoadSegment(
-        name: 'OMR Perungudi',
-        elevation: 4.5,
-        drainageDistance: 90,
-        points: [
-          LatLng(12.9550, 80.2450),
-          LatLng(12.9650, 80.2500),
-          LatLng(12.9750, 80.2550),
-        ],
-      ),
-
-      RoadSegment(
-        name: 'Anna Salai',
-        elevation: 7.8,
-        drainageDistance: 60,
-        points: [
-          LatLng(13.0400, 80.2500),
-          LatLng(13.0500, 80.2550),
-          LatLng(13.0600, 80.2600),
-        ],
-      ),
-
-      RoadSegment(
-        name: 'Kathipara Corridor',
-        elevation: 11.5,
-        drainageDistance: 40,
-        points: [
-          LatLng(13.0100, 80.1950),
-          LatLng(13.0150, 80.2050),
-          LatLng(13.0200, 80.2150),
-        ],
-      ),
-    ];
-
-    // Fetch live rainfall.
     fetchWeather();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      getCurrentLocation();
+    });
   }
 
   // ============================================================
-  // FETCH WEATHER
+  // WEATHER
   // ============================================================
 
   Future<void> fetchWeather() async {
@@ -142,25 +94,19 @@ class _MapScreenState extends State<MapScreen> {
       setState(() {
         rainfall = rain;
         isLoadingWeather = false;
-        weatherError = '';
       });
-
-      updateRisk();
     } catch (e) {
       if (!mounted) return;
 
       setState(() {
         isLoadingWeather = false;
-        weatherError = 'Unable to fetch rainfall data';
+        rainfall = 0;
       });
-
-      // Still calculate risk using the default rainfall value.
-      updateRisk();
     }
   }
 
   // ============================================================
-  // GET CURRENT LOCATION
+  // LOCATION
   // ============================================================
 
   Future<void> getCurrentLocation() async {
@@ -172,48 +118,27 @@ class _MapScreenState extends State<MapScreen> {
     });
 
     try {
-      // Get current GPS location using your LocationService.
-      final position = await LocationService.getCurrentLocation();
+      final position =
+          await LocationService.getCurrentLocation();
 
       if (!mounted) return;
 
       setState(() {
         currentPosition = position;
         isLoadingLocation = false;
-        locationError = '';
       });
 
-      // ----------------------------------------------------------
-      // MOVE MAP TO USER LOCATION
-      // ----------------------------------------------------------
-
-      mapController.move(
-        LatLng(
-          position.latitude,
-          position.longitude,
-        ),
-        14.0,
+      final location = LatLng(
+        position.latitude,
+        position.longitude,
       );
 
-      // ----------------------------------------------------------
-      // IMPORTANT:
-      // GO TO NEXT SCREEN AFTER LOCATION IS SUCCESSFULLY FOUND
-      // ----------------------------------------------------------
+      mapController.move(location, 14);
 
-      await Future.delayed(
-        const Duration(milliseconds: 500),
-      );
-
-      if (!mounted) return;
-
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) => LocationResultScreen(
-            latitude: position.latitude,
-            longitude: position.longitude,
-            travelMode: widget.travelMode,
-          ),
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Current location detected.'),
+          backgroundColor: Colors.green,
         ),
       );
     } catch (e) {
@@ -221,53 +146,233 @@ class _MapScreenState extends State<MapScreen> {
 
       setState(() {
         isLoadingLocation = false;
-
         locationError = e
             .toString()
             .replaceFirst('Exception: ', '');
       });
+    }
+  }
 
-      // Show the error clearly to the user.
+  // ============================================================
+  // DESTINATION
+  // ============================================================
+
+  void selectDestination(LatLng point) {
+    if (currentPosition == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Please detect your current location first.',
+          ),
+        ),
+      );
+
+      return;
+    }
+
+    setState(() {
+      destination = point;
+
+      routeCalculated = false;
+
+      routes = [];
+
+      safestRoute = null;
+
+      routeError = '';
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Destination selected. Tap "Find Safest Route".',
+        ),
+      ),
+    );
+  }
+
+  // ============================================================
+  // FIND REAL ROUTES
+  // ============================================================
+
+  Future<void> findSafestRoute() async {
+    if (currentPosition == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Please detect your current location first.',
+          ),
+        ),
+      );
+
+      return;
+    }
+
+    if (destination == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Please tap on the map to select a destination.',
+          ),
+        ),
+      );
+
+      return;
+    }
+
+    setState(() {
+      isLoadingRoutes = true;
+      routeCalculated = false;
+      routeError = '';
+      routes = [];
+      safestRoute = null;
+    });
+
+    try {
+      final result = await RouteService.getRoutes(
+        startLat: currentPosition!.latitude,
+        startLng: currentPosition!.longitude,
+        endLat: destination!.latitude,
+        endLng: destination!.longitude,
+      );
+
+      if (!mounted) return;
+
+      if (result.isEmpty) {
+        throw Exception('No routes were found.');
+      }
+
+      setState(() {
+        routes = result;
+        isLoadingRoutes = false;
+        routeCalculated = true;
+      });
+
+      // Select safest route
+      selectedRouteIndex = calculateSafestRouteIndex();
+
+      if (selectedRouteIndex >= routes.length) {
+        selectedRouteIndex = 0;
+      }
+
+      setState(() {
+        safestRoute = routes[selectedRouteIndex];
+      });
+
+      fitMapToRoute(routes[selectedRouteIndex]);
+
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            locationError.isEmpty
-                ? 'Unable to get your location'
-                : locationError,
+            '${routes.length} route${routes.length == 1 ? '' : 's'} found.',
+          ),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        isLoadingRoutes = false;
+        routeCalculated = false;
+        routeError = e
+            .toString()
+            .replaceFirst('Exception: ', '');
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Unable to find route: $routeError',
           ),
           backgroundColor: Colors.red,
-          duration: const Duration(seconds: 4),
         ),
       );
     }
   }
 
   // ============================================================
-  // UPDATE ROAD RISK
+  // SAFEST ROUTE CALCULATION
   // ============================================================
 
-  void updateRisk() {
-    for (final road in roads) {
-      road.riskLevel = RiskService.calculateRisk(
-        rainfall: rainfall,
-        elevation: road.elevation,
-        drainageDistance: road.drainageDistance,
-      );
+  int calculateSafestRouteIndex() {
+    if (routes.isEmpty) {
+      return 0;
     }
 
-    // Find safest available road.
-    recommendedRoad = RouteService.findSafestRoad(roads);
+    int bestIndex = 0;
+    double bestScore = double.infinity;
 
-    if (mounted) {
-      setState(() {});
+    for (int i = 0; i < routes.length; i++) {
+      final route = routes[i];
+
+      final score = calculateRouteRiskScore(route);
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
     }
+
+    return bestIndex;
+  }
+
+  // ============================================================
+  // ROUTE RISK SCORE
+  //
+  // This is a prototype risk model.
+  //
+  // Later this can be replaced with:
+  // rainfall + elevation + drainage + live flood data
+  // ============================================================
+
+  double calculateRouteRiskScore(RouteOption route) {
+    final distanceKm = route.distanceKm;
+
+    double score = 0;
+
+    // Rainfall contribution
+    if (rainfall >= 100) {
+      score += 70;
+    } else if (rainfall >= 50) {
+      score += 45;
+    } else if (rainfall >= 20) {
+      score += 25;
+    } else {
+      score += 10;
+    }
+
+    // Longer route gets a small penalty.
+    score += distanceKm * 2;
+
+    // Longer routes are not automatically unsafe.
+    // The rainfall component remains dominant.
+    return score;
+  }
+
+  // ============================================================
+  // ROUTE RISK LEVEL
+  // ============================================================
+
+  RiskLevel routeRiskLevel(RouteOption route) {
+    final score = calculateRouteRiskScore(route);
+
+    if (score >= 70) {
+      return RiskLevel.impassable;
+    }
+
+    if (score >= 35) {
+      return RiskLevel.moderate;
+    }
+
+    return RiskLevel.safe;
   }
 
   // ============================================================
   // RISK COLOR
   // ============================================================
 
-  Color getRiskColor(RiskLevel level) {
+  Color riskColor(RiskLevel level) {
     switch (level) {
       case RiskLevel.safe:
         return Colors.green;
@@ -284,7 +389,7 @@ class _MapScreenState extends State<MapScreen> {
   // RISK TEXT
   // ============================================================
 
-  String getRiskText(RiskLevel level) {
+  String riskText(RiskLevel level) {
     switch (level) {
       case RiskLevel.safe:
         return 'SAFE';
@@ -293,8 +398,166 @@ class _MapScreenState extends State<MapScreen> {
         return 'MODERATE';
 
       case RiskLevel.impassable:
-        return 'IMPASSABLE';
+        return 'HIGH RISK';
     }
+  }
+
+  // ============================================================
+  // FIT MAP TO SELECTED ROUTE
+  // ============================================================
+
+  void fitMapToRoute(RouteOption route) {
+    if (route.coordinates.isEmpty) return;
+
+    double minLat = route.coordinates.first[0];
+    double maxLat = route.coordinates.first[0];
+
+    double minLng = route.coordinates.first[1];
+    double maxLng = route.coordinates.first[1];
+
+    for (final point in route.coordinates) {
+      final lat = point[0];
+      final lng = point[1];
+
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+
+      if (lng < minLng) minLng = lng;
+      if (lng > maxLng) maxLng = lng;
+    }
+
+    if (currentPosition != null) {
+      minLat = minLat <
+              currentPosition!.latitude
+          ? minLat
+          : currentPosition!.latitude;
+
+      maxLat = maxLat >
+              currentPosition!.latitude
+          ? maxLat
+          : currentPosition!.latitude;
+
+      minLng = minLng <
+              currentPosition!.longitude
+          ? minLng
+          : currentPosition!.longitude;
+
+      maxLng = maxLng >
+              currentPosition!.longitude
+          ? maxLng
+          : currentPosition!.longitude;
+    }
+
+    if (destination != null) {
+      minLat = minLat < destination!.latitude
+          ? minLat
+          : destination!.latitude;
+
+      maxLat = maxLat > destination!.latitude
+          ? maxLat
+          : destination!.latitude;
+
+      minLng = minLng < destination!.longitude
+          ? minLng
+          : destination!.longitude;
+
+      maxLng = maxLng > destination!.longitude
+          ? maxLng
+          : destination!.longitude;
+    }
+
+    final center = LatLng(
+      (minLat + maxLat) / 2,
+      (minLng + maxLng) / 2,
+    );
+
+    mapController.move(center, calculateZoom());
+  }
+
+  double calculateZoom() {
+    if (currentPosition == null ||
+        destination == null) {
+      return 13;
+    }
+
+    final distance = const Distance().as(
+      LengthUnit.Kilometer,
+      LatLng(
+        currentPosition!.latitude,
+        currentPosition!.longitude,
+      ),
+      destination!,
+    );
+
+    if (distance < 2) return 15;
+
+    if (distance < 5) return 14;
+
+    if (distance < 10) return 13;
+
+    if (distance < 20) return 12;
+
+    return 11;
+  }
+
+  // ============================================================
+  // SELECT A DIFFERENT ROUTE
+  // ============================================================
+
+  void selectRoute(int index) {
+    if (index < 0 || index >= routes.length) {
+      return;
+    }
+
+    setState(() {
+      selectedRouteIndex = index;
+      safestRoute = routes[index];
+    });
+
+    fitMapToRoute(routes[index]);
+  }
+
+  // ============================================================
+  // TRANSPORT ICON
+  // ============================================================
+
+  IconData transportIcon() {
+    final mode =
+        widget.travelMode.toLowerCase();
+
+    if (mode.contains('bike')) {
+      return Icons.two_wheeler;
+    }
+
+    if (mode.contains('bus')) {
+      return Icons.directions_bus;
+    }
+
+    if (mode.contains('walking')) {
+      return Icons.directions_walk;
+    }
+
+    if (mode.contains('ambulance')) {
+      return Icons.local_hospital;
+    }
+
+    if (mode.contains('rescue')) {
+      return Icons.emergency;
+    }
+
+    return Icons.directions_car;
+  }
+
+  // ============================================================
+  // FORMAT DISTANCE
+  // ============================================================
+
+  String formatDistance(double km) {
+    if (km < 1) {
+      return '${(km * 1000).round()} m';
+    }
+
+    return '${km.toStringAsFixed(1)} km';
   }
 
   // ============================================================
@@ -304,57 +567,45 @@ class _MapScreenState extends State<MapScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // ========================================================
-      // APP BAR
-      // ========================================================
-
       appBar: AppBar(
-        title: Text(widget.travelMode),
-        centerTitle: true,
-        actions: [
-          // Refresh weather button.
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Refresh rainfall',
-            onPressed: isLoadingWeather
-                ? null
-                : () {
-                    setState(() {
-                      isLoadingWeather = true;
-                      weatherError = '';
-                    });
-
-                    fetchWeather();
-                  },
+        title: const Text(
+          'HydroPulse Map',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
           ),
-        ],
+        ),
+        centerTitle: true,
       ),
-
-      // ========================================================
-      // BODY
-      // ========================================================
 
       body: Stack(
         children: [
-          // ====================================================
+          // ======================================================
           // MAP
-          // ====================================================
+          // ======================================================
 
           FlutterMap(
             mapController: mapController,
 
-            options: const MapOptions(
-              initialCenter: LatLng(
+            options: MapOptions(
+              initialCenter:
+                  const LatLng(
                 13.0827,
                 80.2707,
               ),
+
               initialZoom: 11.5,
+
+              onTap: (tapPosition, point) {
+                if (widget.selectionMode) {
+                  selectDestination(point);
+                }
+              },
             ),
 
             children: [
-              // ------------------------------------------------
+              // ==================================================
               // OPEN STREET MAP
-              // ------------------------------------------------
+              // ==================================================
 
               TileLayer(
                 urlTemplate:
@@ -364,160 +615,246 @@ class _MapScreenState extends State<MapScreen> {
                     'com.example.hydropulse',
               ),
 
-              // ------------------------------------------------
-              // FLOOD RISK ROAD SEGMENTS
-              // ------------------------------------------------
+              // ==================================================
+              // REAL ROUTES
+              // ==================================================
 
-              PolylineLayer(
-                polylines: roads.map((road) {
-                  final isRecommended =
-                      recommendedRoad == road;
+              if (routes.isNotEmpty)
+                PolylineLayer(
+                  polylines: [
+                    for (int i = 0;
+                        i < routes.length;
+                        i++)
+                      Polyline(
+                        points: routes[i]
+                            .coordinates
+                            .map(
+                              (point) => LatLng(
+                                point[0],
+                                point[1],
+                              ),
+                            )
+                            .toList(),
 
-                  return Polyline(
-                    points: road.points,
+                        strokeWidth:
+                            i == selectedRouteIndex
+                                ? 8
+                                : 5,
 
-                    // Recommended road is thicker.
-                    strokeWidth:
-                        isRecommended ? 11 : 7,
+                        color:
+                            i == selectedRouteIndex
+                                ? Colors.blue
+                                : riskColor(
+                                    routeRiskLevel(
+                                      routes[i],
+                                    ),
+                                  ),
+                      ),
+                  ],
+                ),
 
-                    // Recommended route is blue.
-                    // Other roads use their risk color.
-                    color: isRecommended
-                        ? Colors.blue
-                        : getRiskColor(
-                            road.riskLevel,
-                          ),
-                  );
-                }).toList(),
-              ),
+              // ==================================================
+              // MARKERS
+              // ==================================================
 
-              // ------------------------------------------------
-              // USER LOCATION MARKER
-              // ------------------------------------------------
-
-              if (currentPosition != null)
-                MarkerLayer(
-                  markers: [
+              MarkerLayer(
+                markers: [
+                  // CURRENT LOCATION
+                  if (currentPosition != null)
                     Marker(
                       point: LatLng(
-                        currentPosition!.latitude,
-                        currentPosition!.longitude,
+                        currentPosition!
+                            .latitude,
+                        currentPosition!
+                            .longitude,
                       ),
 
                       width: 55,
                       height: 55,
 
                       child: Container(
-                        decoration: BoxDecoration(
+                        decoration:
+                            BoxDecoration(
                           color: Colors.blue
-                              .withOpacity(0.18),
-                          shape: BoxShape.circle,
+                              .withOpacity(0.15),
+                          shape:
+                              BoxShape.circle,
                         ),
 
-                        child: const Center(
-                          child: Icon(
-                            Icons.my_location,
-                            color: Colors.blue,
-                            size: 30,
-                          ),
+                        child:
+                            const Icon(
+                          Icons.my_location,
+                          color: Colors.blue,
+                          size: 35,
                         ),
+                      ),
+                    ),
+
+                  // DESTINATION
+                  if (destination != null)
+                    Marker(
+                      point: destination!,
+
+                      width: 55,
+                      height: 55,
+
+                      child: const Icon(
+                        Icons.location_on,
+                        color: Colors.red,
+                        size: 42,
+                      ),
+                    ),
+                ],
+              ),
+            ],
+          ),
+
+          // ======================================================
+          // TRANSPORT CARD
+          // ======================================================
+
+          Positioned(
+            top: 12,
+            left: 12,
+            right: 12,
+
+            child: Card(
+              elevation: 7,
+
+              child: Padding(
+                padding:
+                    const EdgeInsets.all(13),
+
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      backgroundColor:
+                          Colors.blue
+                              .withOpacity(0.12),
+
+                      child: Icon(
+                        transportIcon(),
+                        color: Colors.blue,
+                      ),
+                    ),
+
+                    const SizedBox(width: 10),
+
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment:
+                            CrossAxisAlignment.start,
+
+                        children: [
+                          const Text(
+                            'Transport Mode',
+                            style: TextStyle(
+                              color: Colors.grey,
+                              fontSize: 11,
+                            ),
+                          ),
+
+                          Text(
+                            widget.travelMode,
+                            style:
+                                const TextStyle(
+                              fontSize: 16,
+                              fontWeight:
+                                  FontWeight.bold,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
                 ),
-            ],
+              ),
+            ),
           ),
 
-          // ====================================================
-          // RECOMMENDED ROUTE CARD
-          // ====================================================
+          // ======================================================
+          // LOCATION / DESTINATION INSTRUCTIONS
+          // ======================================================
 
-          if (!isLoadingWeather &&
-              recommendedRoad != null)
+          if (widget.selectionMode &&
+              !routeCalculated)
             Positioned(
-              top: 16,
-              left: 16,
-              right: 16,
+              top: 90,
+              left: 12,
+              right: 12,
 
               child: Card(
                 elevation: 6,
 
                 child: Padding(
                   padding:
-                      const EdgeInsets.all(14),
+                      const EdgeInsets.all(13),
 
-                  child: Row(
+                  child: Column(
+                    crossAxisAlignment:
+                        CrossAxisAlignment.start,
+
                     children: [
-                      // Route icon.
-                      Container(
-                        width: 44,
-                        height: 44,
-
-                        decoration: BoxDecoration(
-                          color: Colors.blue
-                              .withOpacity(0.12),
-                          shape: BoxShape.circle,
-                        ),
-
-                        child: const Icon(
-                          Icons.route,
-                          color: Colors.blue,
+                      const Text(
+                        'Select your locations',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight:
+                              FontWeight.bold,
                         ),
                       ),
 
-                      const SizedBox(width: 12),
+                      const SizedBox(height: 7),
 
-                      // Route information.
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment:
-                              CrossAxisAlignment.start,
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.my_location,
+                            color: Colors.blue,
+                            size: 18,
+                          ),
 
-                          children: [
-                            const Text(
-                              'Recommended Route',
-                              style: TextStyle(
-                                fontSize: 13,
-                                fontWeight:
-                                    FontWeight.bold,
-                              ),
-                            ),
+                          const SizedBox(width: 6),
 
-                            const SizedBox(height: 4),
-
-                            Text(
-                              recommendedRoad!.name,
-                              style: const TextStyle(
-                                fontSize: 16,
-                                fontWeight:
-                                    FontWeight.bold,
-                              ),
-                            ),
-
-                            const SizedBox(height: 3),
-
-                            Text(
-                              getRiskText(
-                                recommendedRoad!
-                                    .riskLevel,
-                              ),
-                              style: TextStyle(
+                          Expanded(
+                            child: Text(
+                              currentPosition ==
+                                      null
+                                  ? 'Current location: Detecting...'
+                                  : 'Current location: Detected',
+                              style:
+                                  const TextStyle(
                                 fontSize: 12,
-                                fontWeight:
-                                    FontWeight.bold,
-                                color: getRiskColor(
-                                  recommendedRoad!
-                                      .riskLevel,
-                                ),
                               ),
                             ),
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
 
-                      const Icon(
-                        Icons.check_circle,
-                        color: Colors.green,
+                      const SizedBox(height: 5),
+
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.location_on,
+                            color: Colors.red,
+                            size: 18,
+                          ),
+
+                          const SizedBox(width: 6),
+
+                          Expanded(
+                            child: Text(
+                              destination == null
+                                  ? 'Tap anywhere on the map to choose destination'
+                                  : 'Destination selected',
+                              style:
+                                  const TextStyle(
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -525,18 +862,544 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ),
 
-          // ====================================================
-          // LOCATION ERROR
-          // ====================================================
+          // ======================================================
+          // LOADING ROUTES
+          // ======================================================
 
-          if (locationError.isNotEmpty)
+          if (isLoadingRoutes)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Container(
+                  color: Colors.black
+                      .withOpacity(0.18),
+
+                  child: Center(
+                    child: Card(
+                      elevation: 8,
+
+                      child: Padding(
+                        padding:
+                            const EdgeInsets
+                                .symmetric(
+                          horizontal: 25,
+                          vertical: 20,
+                        ),
+
+                        child: Column(
+                          mainAxisSize:
+                              MainAxisSize.min,
+
+                          children: const [
+                            CircularProgressIndicator(),
+
+                            SizedBox(height: 15),
+
+                            Text(
+                              'Finding safest routes...',
+                              style: TextStyle(
+                                fontWeight:
+                                    FontWeight.bold,
+                              ),
+                            ),
+
+                            SizedBox(height: 5),
+
+                            Text(
+                              'Analyzing real road paths',
+                              style: TextStyle(
+                                color: Colors.grey,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // ======================================================
+          // MY LOCATION BUTTON
+          // ======================================================
+
+          Positioned(
+            right: 16,
+
+            bottom:
+                widget.selectionMode &&
+                        !routeCalculated
+                    ? 150
+                    : 310,
+
+            child:
+                FloatingActionButton(
+              heroTag:
+                  'hydropulse_my_location',
+
+              backgroundColor:
+                  Colors.white,
+
+              foregroundColor:
+                  Colors.blue,
+
+              onPressed:
+                  isLoadingLocation
+                      ? null
+                      : getCurrentLocation,
+
+              child:
+                  isLoadingLocation
+                      ? const SizedBox(
+                          width: 23,
+                          height: 23,
+                          child:
+                              CircularProgressIndicator(
+                            strokeWidth: 2.5,
+                          ),
+                        )
+                      : const Icon(
+                          Icons.my_location,
+                        ),
+            ),
+          ),
+
+          // ======================================================
+          // FIND SAFEST ROUTE BUTTON
+          // ======================================================
+
+          if (widget.selectionMode &&
+              !routeCalculated &&
+              !isLoadingRoutes)
             Positioned(
               left: 16,
               right: 16,
-              bottom: 185,
+              bottom: 20,
+
+              child: SizedBox(
+                height: 55,
+
+                child:
+                    ElevatedButton.icon(
+                  onPressed:
+                      findSafestRoute,
+
+                  icon: const Icon(
+                    Icons.route,
+                  ),
+
+                  label: const Text(
+                    'Find Safest Route',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight:
+                          FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // ======================================================
+          // RESULT CARD
+          // ======================================================
+
+          if (routeCalculated &&
+              safestRoute != null)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 15,
 
               child: Card(
-                elevation: 5,
+                elevation: 9,
+
+                child: Padding(
+                  padding:
+                      const EdgeInsets.all(15),
+
+                  child: Column(
+                    crossAxisAlignment:
+                        CrossAxisAlignment
+                            .start,
+
+                    children: [
+                      // ------------------------------------------
+                      // HEADER
+                      // ------------------------------------------
+
+                      Row(
+                        children: [
+                          Container(
+                            width: 43,
+                            height: 43,
+
+                            decoration:
+                                BoxDecoration(
+                              color: Colors.green
+                                  .withOpacity(
+                                      0.12),
+
+                              shape:
+                                  BoxShape.circle,
+                            ),
+
+                            child:
+                                const Icon(
+                              Icons
+                                  .verified_user,
+                              color:
+                                  Colors.green,
+                            ),
+                          ),
+
+                          const SizedBox(
+                            width: 10,
+                          ),
+
+                          const Expanded(
+                            child: Text(
+                              'Safest Route Found',
+                              style:
+                                  TextStyle(
+                                fontSize: 17,
+                                fontWeight:
+                                    FontWeight
+                                        .bold,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 10),
+
+                      // ------------------------------------------
+                      // ROUTE NUMBER
+                      // ------------------------------------------
+
+                      Text(
+                        'Route ${selectedRouteIndex + 1}',
+                        style:
+                            const TextStyle(
+                          fontSize: 18,
+                          fontWeight:
+                              FontWeight.bold,
+                        ),
+                      ),
+
+                      const SizedBox(height: 7),
+
+                      // ------------------------------------------
+                      // RISK
+                      // ------------------------------------------
+
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.shield,
+                            size: 18,
+                            color:
+                                riskColor(
+                              routeRiskLevel(
+                                safestRoute!,
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(
+                            width: 5,
+                          ),
+
+                          Text(
+                            riskText(
+                              routeRiskLevel(
+                                safestRoute!,
+                              ),
+                            ),
+
+                            style:
+                                TextStyle(
+                              fontWeight:
+                                  FontWeight
+                                      .bold,
+                              color:
+                                  riskColor(
+                                routeRiskLevel(
+                                  safestRoute!,
+                                ),
+                              ),
+                            ),
+                          ),
+
+                          const Spacer(),
+
+                          Text(
+                            widget.travelMode,
+                            style:
+                                const TextStyle(
+                              color:
+                                  Colors.grey,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const Divider(
+                        height: 20,
+                      ),
+
+                      // ------------------------------------------
+                      // DISTANCE / TIME
+                      // ------------------------------------------
+
+                      Row(
+                        children: [
+                          Expanded(
+                            child:
+                                _RiskInfo(
+                              icon:
+                                  Icons
+                                      .route,
+                              title:
+                                  'Distance',
+                              value:
+                                  formatDistance(
+                                safestRoute!
+                                    .distanceKm,
+                              ),
+                            ),
+                          ),
+
+                          Expanded(
+                            child:
+                                _RiskInfo(
+                              icon:
+                                  Icons
+                                      .access_time,
+                              title:
+                                  'ETA',
+                              value:
+                                  '${safestRoute!.durationMinutes} min',
+                            ),
+                          ),
+
+                          Expanded(
+                            child:
+                                _RiskInfo(
+                              icon:
+                                  Icons
+                                      .water_drop,
+                              title:
+                                  'Rainfall',
+                              value:
+                                  '${rainfall.toStringAsFixed(1)} mm',
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 12),
+
+                      // ------------------------------------------
+                      // ALTERNATIVE ROUTES
+                      // ------------------------------------------
+
+                      if (routes.length > 1)
+                        Column(
+                          crossAxisAlignment:
+                              CrossAxisAlignment
+                                  .start,
+
+                          children: [
+                            const Text(
+                              'Available Routes',
+                              style:
+                                  TextStyle(
+                                fontWeight:
+                                    FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+
+                            const SizedBox(
+                              height: 7,
+                            ),
+
+                            SizedBox(
+                              height: 48,
+
+                              child:
+                                  ListView
+                                      .separated(
+                                scrollDirection:
+                                    Axis
+                                        .horizontal,
+
+                                itemCount:
+                                    routes
+                                        .length,
+
+                                separatorBuilder:
+                                    (_, __) =>
+                                        const SizedBox(
+                                  width: 7,
+                                ),
+
+                                itemBuilder:
+                                    (context,
+                                        index) {
+                                  final route =
+                                      routes[
+                                          index];
+
+                                  final risk =
+                                      routeRiskLevel(
+                                    route,
+                                  );
+
+                                  final selected =
+                                      index ==
+                                          selectedRouteIndex;
+
+                                  return GestureDetector(
+                                    onTap: () =>
+                                        selectRoute(
+                                      index,
+                                    ),
+
+                                    child:
+                                        Container(
+                                      padding:
+                                          const EdgeInsets
+                                              .symmetric(
+                                        horizontal:
+                                            12,
+                                      ),
+
+                                      decoration:
+                                          BoxDecoration(
+                                        color: selected
+                                            ? Colors
+                                                .blue
+                                                .withOpacity(
+                                                    0.10)
+                                            : Colors
+                                                .grey
+                                                .withOpacity(
+                                                    0.08),
+
+                                        borderRadius:
+                                            BorderRadius
+                                                .circular(
+                                                    12),
+
+                                        border:
+                                            Border.all(
+                                          color:
+                                              selected
+                                                  ? Colors
+                                                      .blue
+                                                  : Colors
+                                                      .grey
+                                                      .shade300,
+                                        ),
+                                      ),
+
+                                      child:
+                                          Row(
+                                        children: [
+                                          Icon(
+                                            selected
+                                                ? Icons
+                                                    .radio_button_checked
+                                                : Icons
+                                                    .radio_button_off,
+                                            color:
+                                                selected
+                                                    ? Colors
+                                                        .blue
+                                                    : Colors
+                                                        .grey,
+                                            size: 18,
+                                          ),
+
+                                          const SizedBox(
+                                            width:
+                                                5,
+                                          ),
+
+                                          Text(
+                                            'R${index + 1}',
+                                            style:
+                                                const TextStyle(
+                                              fontWeight:
+                                                  FontWeight
+                                                      .bold,
+                                            ),
+                                          ),
+
+                                          const SizedBox(
+                                            width:
+                                                6,
+                                          ),
+
+                                          Text(
+                                            formatDistance(
+                                              route
+                                                  .distanceKm,
+                                            ),
+                                            style:
+                                                const TextStyle(
+                                              fontSize:
+                                                  11,
+                                            ),
+                                          ),
+
+                                          const SizedBox(
+                                            width:
+                                                6,
+                                          ),
+
+                                          Icon(
+                                            Icons
+                                                .shield,
+                                            size:
+                                                14,
+                                            color:
+                                                riskColor(
+                                              risk,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          // ======================================================
+          // ERROR
+          // ======================================================
+
+          if (locationError.isNotEmpty)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 90,
+
+              child: Card(
+                color: Colors.red.shade50,
 
                 child: Padding(
                   padding:
@@ -549,7 +1412,9 @@ class _MapScreenState extends State<MapScreen> {
                         color: Colors.red,
                       ),
 
-                      const SizedBox(width: 8),
+                      const SizedBox(
+                        width: 8,
+                      ),
 
                       Expanded(
                         child: Text(
@@ -567,491 +1432,103 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ),
 
-          // ====================================================
-          // MY LOCATION BUTTON
-          // ====================================================
+          // ======================================================
+          // ROUTE ERROR
+          // ======================================================
 
-          Positioned(
-            right: 16,
-            bottom: 330,
+          if (routeError.isNotEmpty &&
+              !isLoadingRoutes)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 90,
 
-            child: FloatingActionButton(
-              heroTag: 'locationButton',
+              child: Card(
+                color: Colors.red.shade50,
 
-              backgroundColor: Colors.white,
+                child: Padding(
+                  padding:
+                      const EdgeInsets.all(10),
 
-              foregroundColor: Colors.blue,
-
-              onPressed: isLoadingLocation
-                  ? null
-                  : getCurrentLocation,
-
-              child: isLoadingLocation
-                  ? const SizedBox(
-                      width: 22,
-                      height: 22,
-
-                      child:
-                          CircularProgressIndicator(
-                        strokeWidth: 2,
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons
+                            .wrong_location,
+                        color: Colors.red,
                       ),
-                    )
-                  : const Icon(
-                      Icons.my_location,
-                    ),
-            ),
-          ),
 
-          // ====================================================
-          // BOTTOM WEATHER CARD
-          // ====================================================
+                      const SizedBox(
+                        width: 8,
+                      ),
 
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: 20,
-
-            child: Card(
-              elevation: 6,
-
-              child: Padding(
-                padding:
-                    const EdgeInsets.all(16),
-
-                child: Column(
-                  mainAxisSize:
-                      MainAxisSize.min,
-
-                  children: [
-                    // ------------------------------------------
-                    // CURRENT RAINFALL
-                    // ------------------------------------------
-
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.water_drop,
-                          color: Colors.blue,
-                        ),
-
-                        const SizedBox(width: 8),
-
-                        const Text(
-                          'Current Rainfall',
-                          style: TextStyle(
-                            fontSize: 17,
-                            fontWeight:
-                                FontWeight.bold,
-                          ),
-                        ),
-
-                        const Spacer(),
-
-                        if (isLoadingWeather)
-                          const SizedBox(
-                            width: 20,
-                            height: 20,
-
-                            child:
-                                CircularProgressIndicator(
-                              strokeWidth: 2,
-                            ),
-                          )
-                        else
-                          Text(
-                            '${rainfall.toStringAsFixed(1)} mm',
-                            style:
-                                const TextStyle(
-                              fontSize: 16,
-                              fontWeight:
-                                  FontWeight.bold,
-                            ),
-                          ),
-                      ],
-                    ),
-
-                    // ------------------------------------------
-                    // WEATHER ERROR
-                    // ------------------------------------------
-
-                    if (weatherError.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-
-                      Row(
-                        children: [
-                          const Icon(
-                            Icons.warning_amber,
-                            size: 18,
+                      Expanded(
+                        child: Text(
+                          routeError,
+                          style:
+                              const TextStyle(
                             color: Colors.red,
+                            fontSize: 12,
                           ),
-
-                          const SizedBox(width: 6),
-
-                          Expanded(
-                            child: Text(
-                              weatherError,
-                              style:
-                                  const TextStyle(
-                                color: Colors.red,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ),
-                        ],
+                        ),
                       ),
                     ],
-
-                    const SizedBox(height: 12),
-
-                    // ------------------------------------------
-                    // LOCATION
-                    // ------------------------------------------
-
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.location_on,
-                          size: 20,
-                          color: Colors.red,
-                        ),
-
-                        const SizedBox(width: 6),
-
-                        Text(
-                          currentPosition == null
-                              ? 'Chennai'
-                              : 'Current Location',
-                          style: const TextStyle(
-                            fontWeight:
-                                FontWeight.w500,
-                          ),
-                        ),
-
-                        const Spacer(),
-
-                        const Text(
-                          'Live Weather',
-                          style: TextStyle(
-                            color: Colors.green,
-                            fontSize: 12,
-                            fontWeight:
-                                FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-
-                    const SizedBox(height: 12),
-
-                    const Divider(),
-
-                    const SizedBox(height: 10),
-
-                    // ------------------------------------------
-                    // RISK LEGEND
-                    // ------------------------------------------
-
-                    const Row(
-                      mainAxisAlignment:
-                          MainAxisAlignment
-                              .spaceAround,
-
-                      children: [
-                        _Legend(
-                          color: Colors.green,
-                          text: 'Safe',
-                        ),
-
-                        _Legend(
-                          color: Colors.orange,
-                          text: 'Moderate',
-                        ),
-
-                        _Legend(
-                          color: Colors.red,
-                          text: 'Impassable',
-                        ),
-                      ],
-                    ),
-
-                    const SizedBox(height: 8),
-
-                    // ------------------------------------------
-                    // RECOMMENDED ROUTE LEGEND
-                    // ------------------------------------------
-
-                    Row(
-                      mainAxisAlignment:
-                          MainAxisAlignment.center,
-
-                      children: [
-                        Container(
-                          width: 24,
-                          height: 5,
-
-                          decoration:
-                              BoxDecoration(
-                            color: Colors.blue,
-                            borderRadius:
-                                BorderRadius.circular(
-                              10,
-                            ),
-                          ),
-                        ),
-
-                        const SizedBox(width: 6),
-
-                        const Text(
-                          'Recommended Route',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight:
-                                FontWeight.w500,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+                  ),
                 ),
               ),
             ),
-          ),
         ],
       ),
     );
   }
 }
 
-// ============================================================
-// LOCATION RESULT SCREEN
-// ============================================================
-//
-// This is the screen that opens after the location button
-// successfully gets the user's location.
-//
-// Later, you can replace this with your actual next screen.
-// ============================================================
+// ================================================================
+// RISK INFORMATION WIDGET
+// ================================================================
 
-class LocationResultScreen extends StatelessWidget {
-  final double latitude;
-  final double longitude;
-  final String travelMode;
+class _RiskInfo extends StatelessWidget {
+  final IconData icon;
 
-  const LocationResultScreen({
-    super.key,
-    required this.latitude,
-    required this.longitude,
-    required this.travelMode,
+  final String title;
+
+  final String value;
+
+  const _RiskInfo({
+    required this.icon,
+    required this.title,
+    required this.value,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Location Confirmed'),
-        centerTitle: true,
-      ),
-
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-
-        child: Column(
-          mainAxisAlignment:
-              MainAxisAlignment.center,
-
-          children: [
-            Container(
-              width: 90,
-              height: 90,
-
-              decoration: BoxDecoration(
-                color: Colors.green
-                    .withOpacity(0.12),
-                shape: BoxShape.circle,
-              ),
-
-              child: const Icon(
-                Icons.location_on,
-                color: Colors.green,
-                size: 55,
-              ),
-            ),
-
-            const SizedBox(height: 24),
-
-            const Text(
-              'Location Detected!',
-              style: TextStyle(
-                fontSize: 25,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            const Text(
-              'Your current location has been successfully detected.',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: 15,
-                color: Colors.grey,
-              ),
-            ),
-
-            const SizedBox(height: 24),
-
-            Card(
-              elevation: 3,
-
-              child: Padding(
-                padding:
-                    const EdgeInsets.all(18),
-
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.navigation,
-                          color: Colors.blue,
-                        ),
-
-                        const SizedBox(width: 10),
-
-                        const Text(
-                          'Latitude',
-                          style: TextStyle(
-                            fontWeight:
-                                FontWeight.bold,
-                          ),
-                        ),
-
-                        const Spacer(),
-
-                        Text(
-                          latitude.toStringAsFixed(6),
-                        ),
-                      ],
-                    ),
-
-                    const SizedBox(height: 14),
-
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.navigation,
-                          color: Colors.blue,
-                        ),
-
-                        const SizedBox(width: 10),
-
-                        const Text(
-                          'Longitude',
-                          style: TextStyle(
-                            fontWeight:
-                                FontWeight.bold,
-                          ),
-                        ),
-
-                        const Spacer(),
-
-                        Text(
-                          longitude.toStringAsFixed(6),
-                        ),
-                      ],
-                    ),
-
-                    const SizedBox(height: 14),
-
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.directions_car,
-                          color: Colors.blue,
-                        ),
-
-                        const SizedBox(width: 10),
-
-                        const Text(
-                          'Travel Mode',
-                          style: TextStyle(
-                            fontWeight:
-                                FontWeight.bold,
-                          ),
-                        ),
-
-                        const Spacer(),
-
-                        Text(travelMode),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 30),
-
-            SizedBox(
-              width: double.infinity,
-              height: 52,
-
-              child: ElevatedButton.icon(
-                onPressed: () {
-                  Navigator.pop(context);
-                },
-
-                icon: const Icon(
-                  Icons.arrow_back,
-                ),
-
-                label: const Text(
-                  'Back to Map',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight:
-                        FontWeight.bold,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ============================================================
-// LEGEND WIDGET
-// ============================================================
-
-class _Legend extends StatelessWidget {
-  final Color color;
-  final String text;
-
-  const _Legend({
-    required this.color,
-    required this.text,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
+    return Column(
       children: [
-        Container(
-          width: 12,
-          height: 12,
+        Icon(
+          icon,
+          color: Colors.blue,
+          size: 20,
+        ),
 
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
+        const SizedBox(height: 4),
+
+        Text(
+          title,
+          style: const TextStyle(
+            color: Colors.grey,
+            fontSize: 10,
           ),
         ),
 
-        const SizedBox(width: 5),
+        const SizedBox(height: 2),
 
-        Text(text),
+        Text(
+          value,
+          style: const TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 12,
+          ),
+        ),
       ],
     );
   }

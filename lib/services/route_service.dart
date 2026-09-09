@@ -1,65 +1,79 @@
-import '../models/road_segment.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+
+class RouteOption {
+  final List<List<double>> coordinates;
+  final double distanceMeters;
+  final double durationSeconds;
+
+  RouteOption({
+    required this.coordinates,
+    required this.distanceMeters,
+    required this.durationSeconds,
+  });
+
+  double get distanceKm => distanceMeters / 1000;
+
+  int get durationMinutes => (durationSeconds / 60).round();
+}
 
 class RouteService {
-  /// Returns the safest available road.
-  ///
-  /// Priority:
-  /// 1. Safe roads
-  /// 2. Moderate roads
-  /// 3. Impassable roads are avoided
-  static RoadSegment? findSafestRoad(
-    List<RoadSegment> roads,
-  ) {
-    // Remove impassable roads.
-    final availableRoads = roads
-        .where(
-          (road) => road.riskLevel != RiskLevel.impassable,
-        )
-        .toList();
+  static const String _baseUrl = 'https://router.project-osrm.org';
 
-    // If every road is impassable, no safe route exists.
-    if (availableRoads.isEmpty) {
-      return null;
-    }
-
-    // Safe roads are preferred over moderate roads.
-    availableRoads.sort(
-      (a, b) {
-        return riskPriority(a.riskLevel)
-            .compareTo(riskPriority(b.riskLevel));
-      },
+  static Future<List<RouteOption>> getRoutes({
+    required double startLat,
+    required double startLng,
+    required double endLat,
+    required double endLng,
+  }) async {
+    final url = Uri.parse(
+      '$_baseUrl/route/v1/driving/'
+      '$startLng,$startLat;'
+      '$endLng,$endLat'
+      '?alternatives=true'
+      '&steps=true'
+      '&overview=full'
+      '&geometries=geojson',
     );
 
-    return availableRoads.first;
-  }
+    final response = await http.get(url);
 
-  /// Gives each risk level a priority.
-  static int riskPriority(RiskLevel level) {
-    switch (level) {
-      case RiskLevel.safe:
-        return 0;
-
-      case RiskLevel.moderate:
-        return 1;
-
-      case RiskLevel.impassable:
-        return 2;
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Routing service failed: ${response.statusCode}',
+      );
     }
-  }
 
-  /// Returns all roads sorted from safest to most dangerous.
-  static List<RoadSegment> rankRoads(
-    List<RoadSegment> roads,
-  ) {
-    final sortedRoads = List<RoadSegment>.from(roads);
+    final data = jsonDecode(response.body);
 
-    sortedRoads.sort(
-      (a, b) {
-        return riskPriority(a.riskLevel)
-            .compareTo(riskPriority(b.riskLevel));
-      },
-    );
+    if (data['code'] != 'Ok') {
+      throw Exception(
+        'No route found: ${data['code']}',
+      );
+    }
 
-    return sortedRoads;
+    final routes = data['routes'] as List;
+
+    return routes.map<RouteOption>((route) {
+      final geometry = route['geometry'];
+
+      final rawCoordinates =
+          geometry['coordinates'] as List;
+
+      final coordinates = rawCoordinates.map<List<double>>((point) {
+        return [
+          (point[1] as num).toDouble(), // latitude
+          (point[0] as num).toDouble(), // longitude
+        ];
+      }).toList();
+
+      return RouteOption(
+        coordinates: coordinates,
+        distanceMeters:
+            (route['distance'] as num).toDouble(),
+        durationSeconds:
+            (route['duration'] as num).toDouble(),
+      );
+    }).toList();
   }
 }
