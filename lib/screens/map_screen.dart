@@ -1,17 +1,17 @@
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 
-
 import '../services/weather_service.dart';
 import '../services/route_service.dart';
 import '../services/location_service.dart';
+import '../services/elevation_service.dart';
 import '../models/road_segment.dart';
 
 class MapScreen extends StatefulWidget {
   final String travelMode;
-
   final bool selectionMode;
 
   const MapScreen({
@@ -32,20 +32,25 @@ class _MapScreenState extends State<MapScreen> {
   // ============================================================
 
   Position? currentPosition;
-
   LatLng? destination;
 
   bool isLoadingLocation = false;
-
   String locationError = '';
 
   // ============================================================
   // WEATHER
   // ============================================================
 
+  // General/current rainfall shown before route analysis.
   double rainfall = 0;
 
   bool isLoadingWeather = true;
+
+  // Rainfall for every route.
+  //
+  // routeRainfallScores[index] =
+  // rainfall detected along that route.
+  List<double> routeRainfallScores = [];
 
   // ============================================================
   // ROUTING
@@ -62,6 +67,16 @@ class _MapScreenState extends State<MapScreen> {
   bool routeCalculated = false;
 
   String routeError = '';
+
+  // ============================================================
+  // RISK SCORES
+  // ============================================================
+
+  // Final risk score for every route.
+  List<double> riskScores = [];
+
+  // Elevation component for every route.
+  List<double> elevationScores = [];
 
   // ============================================================
   // INIT
@@ -102,6 +117,8 @@ class _MapScreenState extends State<MapScreen> {
         isLoadingWeather = false;
         rainfall = 0;
       });
+
+      print('Weather loading failed: $e');
     }
   }
 
@@ -118,8 +135,7 @@ class _MapScreenState extends State<MapScreen> {
     });
 
     try {
-      final position =
-          await LocationService.getCurrentLocation();
+      final position = await LocationService.getCurrentLocation();
 
       if (!mounted) return;
 
@@ -146,9 +162,10 @@ class _MapScreenState extends State<MapScreen> {
 
       setState(() {
         isLoadingLocation = false;
-        locationError = e
-            .toString()
-            .replaceFirst('Exception: ', '');
+        locationError = e.toString().replaceFirst(
+              'Exception: ',
+              '',
+            );
       });
     }
   }
@@ -179,6 +196,12 @@ class _MapScreenState extends State<MapScreen> {
 
       safestRoute = null;
 
+      riskScores = [];
+
+      elevationScores = [];
+
+      routeRainfallScores = [];
+
       routeError = '';
     });
 
@@ -192,7 +215,7 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // ============================================================
-  // FIND REAL ROUTES
+  // FIND REAL ROUTES + ANALYZE RISK
   // ============================================================
 
   Future<void> findSafestRoute() async {
@@ -226,9 +249,17 @@ class _MapScreenState extends State<MapScreen> {
       routeError = '';
       routes = [];
       safestRoute = null;
+      riskScores = [];
+      elevationScores = [];
+      routeRainfallScores = [];
     });
 
     try {
+      // ========================================================
+      // STEP 1
+      // Get real road routes.
+      // ========================================================
+
       final result = await RouteService.getRoutes(
         startLat: currentPosition!.latitude,
         startLng: currentPosition!.longitude,
@@ -244,27 +275,54 @@ class _MapScreenState extends State<MapScreen> {
 
       setState(() {
         routes = result;
-        isLoadingRoutes = false;
-        routeCalculated = true;
       });
 
-      // Select safest route
-      selectedRouteIndex = calculateSafestRouteIndex();
+      // ========================================================
+      // STEP 2
+      // Analyze every route.
+      //
+      // Each route gets:
+      //
+      // 1. Live rainfall along the route
+      // 2. Real elevation
+      // 3. Distance
+      //
+      // Then we calculate the final risk score.
+      // ========================================================
 
-      if (selectedRouteIndex >= routes.length) {
+      final safestIndex = await calculateSafestRouteIndex();
+
+      if (!mounted) return;
+
+      if (safestIndex >= routes.length) {
         selectedRouteIndex = 0;
+      } else {
+        selectedRouteIndex = safestIndex;
       }
 
       setState(() {
         safestRoute = routes[selectedRouteIndex];
+
+        isLoadingRoutes = false;
+
+        routeCalculated = true;
       });
 
+      // ========================================================
+      // STEP 3
+      // Fit map to safest route.
+      // ========================================================
+
       fitMapToRoute(routes[selectedRouteIndex]);
+
+      // ========================================================
+      // RESULT MESSAGE
+      // ========================================================
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            '${routes.length} route${routes.length == 1 ? '' : 's'} found.',
+            '${routes.length} route${routes.length == 1 ? '' : 's'} analyzed using live rainfall, elevation and distance.',
           ),
           backgroundColor: Colors.green,
         ),
@@ -275,9 +333,11 @@ class _MapScreenState extends State<MapScreen> {
       setState(() {
         isLoadingRoutes = false;
         routeCalculated = false;
-        routeError = e
-            .toString()
-            .replaceFirst('Exception: ', '');
+
+        routeError = e.toString().replaceFirst(
+              'Exception: ',
+              '',
+            );
       });
 
       ScaffoldMessenger.of(context).showSnackBar(
@@ -292,76 +352,420 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // ============================================================
-  // SAFEST ROUTE CALCULATION
+  // ELEVATION RISK
   // ============================================================
 
-  int calculateSafestRouteIndex() {
-    if (routes.isEmpty) {
-      return 0;
-    }
+  Future<double> calculateElevationRisk(
+    RouteOption route,
+  ) async {
+    try {
+      final elevations =
+          await ElevationService.getElevations(
+        route.coordinates,
+      );
 
-    int bestIndex = 0;
-    double bestScore = double.infinity;
+      if (elevations.isEmpty) {
+        print(
+          'Elevation data empty. Using fallback score.',
+        );
 
-    for (int i = 0; i < routes.length; i++) {
-      final route = routes[i];
-
-      final score = calculateRouteRiskScore(route);
-
-      if (score < bestScore) {
-        bestScore = score;
-        bestIndex = i;
+        return 25.0;
       }
+
+      final minElevation =
+          elevations.reduce(
+        (a, b) => a < b ? a : b,
+      );
+
+      final maxElevation =
+          elevations.reduce(
+        (a, b) => a > b ? a : b,
+      );
+
+      final averageElevation =
+          elevations.reduce(
+                (a, b) => a + b,
+              ) /
+              elevations.length;
+
+      final elevationRange =
+          maxElevation - minElevation;
+
+      // ========================================================
+      // LOWER TERRAIN COMPONENT
+      // ========================================================
+
+      double lowTerrainScore = 0;
+
+      if (minElevation < 2) {
+        lowTerrainScore = 30;
+      } else if (minElevation < 5) {
+        lowTerrainScore = 22;
+      } else if (minElevation < 10) {
+        lowTerrainScore = 14;
+      } else if (minElevation < 20) {
+        lowTerrainScore = 7;
+      } else {
+        lowTerrainScore = 3;
+      }
+
+      // ========================================================
+      // TERRAIN VARIATION
+      // ========================================================
+
+      final terrainVariationScore =
+          elevationRange.clamp(0, 10).toDouble();
+
+      final score =
+          lowTerrainScore +
+          terrainVariationScore;
+
+      print(
+        'Elevation analysis: '
+        'min=${minElevation.toStringAsFixed(2)}m, '
+        'avg=${averageElevation.toStringAsFixed(2)}m, '
+        'max=${maxElevation.toStringAsFixed(2)}m, '
+        'score=${score.toStringAsFixed(1)}',
+      );
+
+      return score.clamp(0, 40).toDouble();
+    } catch (e) {
+      print(
+        'Elevation analysis failed: $e',
+      );
+
+      // Keep routing working if elevation API fails.
+      return 20.0;
+    }
+  }
+
+  // ============================================================
+  // RAINFALL SCORE
+  // ============================================================
+
+  double calculateRainfallRiskScore(
+    double routeRainfall,
+  ) {
+    if (routeRainfall >= 100) {
+      return 50;
     }
 
-    return bestIndex;
+    if (routeRainfall >= 75) {
+      return 42;
+    }
+
+    if (routeRainfall >= 50) {
+      return 35;
+    }
+
+    if (routeRainfall >= 20) {
+      return 25;
+    }
+
+    if (routeRainfall > 0) {
+      return 15;
+    }
+
+    return 5;
+  }
+
+  // ============================================================
+  // ROUTE RAINFALL
+  // ============================================================
+
+  Future<double> calculateRouteRainfall(
+    RouteOption route,
+  ) async {
+    try {
+      final routeRainfall =
+          await WeatherService.getRouteRainfall(
+        route.coordinates,
+      );
+
+      print(
+        'Route rainfall: '
+        '${routeRainfall.toStringAsFixed(2)} mm',
+      );
+
+      return routeRainfall;
+    } catch (e) {
+      print(
+        'Route rainfall calculation failed: $e',
+      );
+
+      // Keep routing working if weather API fails.
+      return rainfall;
+    }
   }
 
   // ============================================================
   // ROUTE RISK SCORE
-  //
-  // This is a prototype risk model.
-  //
-  // Later this can be replaced with:
-  // rainfall + elevation + drainage + live flood data
   // ============================================================
 
-  double calculateRouteRiskScore(RouteOption route) {
-    final distanceKm = route.distanceKm;
+  Future<double> calculateRouteRiskScore(
+    RouteOption route,
+    int routeIndex,
+  ) async {
+    // ==========================================================
+    // LIVE RAINFALL ALONG THIS ROUTE
+    // ==========================================================
 
-    double score = 0;
+    final routeRainfall =
+        await calculateRouteRainfall(route);
 
-    // Rainfall contribution
-    if (rainfall >= 100) {
-      score += 70;
-    } else if (rainfall >= 50) {
-      score += 45;
-    } else if (rainfall >= 20) {
-      score += 25;
-    } else {
-      score += 10;
-    }
+    final rainfallScore =
+        calculateRainfallRiskScore(
+      routeRainfall,
+    );
 
-    // Longer route gets a small penalty.
-    score += distanceKm * 2;
+    // ==========================================================
+    // REAL ELEVATION
+    // ==========================================================
 
-    // Longer routes are not automatically unsafe.
-    // The rainfall component remains dominant.
+    final elevationRisk =
+        await calculateElevationRisk(route);
+
+    // ==========================================================
+    // DISTANCE
+    // ==========================================================
+
+    final distanceScore =
+        route.distanceKm * 1.2;
+
+    // ==========================================================
+    // FINAL SCORE
+    // ==========================================================
+
+    final score =
+        rainfallScore +
+        elevationRisk +
+        distanceScore;
+
+    print(
+      'Route ${routeIndex + 1}: '
+      'rainfall=${routeRainfall.toStringAsFixed(1)} mm, '
+      'rainfallScore=${rainfallScore.toStringAsFixed(1)}, '
+      'elevation=${elevationRisk.toStringAsFixed(1)}, '
+      'distanceScore=${distanceScore.toStringAsFixed(1)}, '
+      'TOTAL=${score.toStringAsFixed(1)}',
+    );
+
     return score;
   }
 
   // ============================================================
-  // ROUTE RISK LEVEL
+  // CALCULATE SAFEST ROUTE
   // ============================================================
 
-  RiskLevel routeRiskLevel(RouteOption route) {
-    final score = calculateRouteRiskScore(route);
+  Future<int> calculateSafestRouteIndex() async {
+    if (routes.isEmpty) {
+      return 0;
+    }
 
-    if (score >= 70) {
+    double lowestScore = double.infinity;
+
+    int safestIndex = 0;
+
+    final calculatedRiskScores = <double>[];
+
+    final calculatedElevationScores = <double>[];
+
+    final calculatedRainfallScores = <double>[];
+
+    // ==========================================================
+    // Analyze every route.
+    // ==========================================================
+
+    for (int i = 0; i < routes.length; i++) {
+      final route = routes[i];
+
+      // --------------------------------------------------------
+      // LIVE RAINFALL ALONG THIS ROUTE
+      // --------------------------------------------------------
+
+      final routeRainfall =
+          await calculateRouteRainfall(route);
+
+      final rainfallScore =
+          calculateRainfallRiskScore(
+        routeRainfall,
+      );
+
+      // --------------------------------------------------------
+      // REAL ELEVATION
+      // --------------------------------------------------------
+
+      final elevationRisk =
+          await calculateElevationRisk(route);
+
+      // --------------------------------------------------------
+      // DISTANCE
+      // --------------------------------------------------------
+
+      final distanceScore =
+          route.distanceKm * 1.2;
+
+      // --------------------------------------------------------
+      // FINAL RISK
+      // --------------------------------------------------------
+
+      final score =
+          rainfallScore +
+          elevationRisk +
+          distanceScore;
+
+      // --------------------------------------------------------
+      // Save values.
+      // --------------------------------------------------------
+
+      calculatedRiskScores.add(score);
+
+      calculatedElevationScores.add(
+        elevationRisk,
+      );
+
+      calculatedRainfallScores.add(
+        routeRainfall,
+      );
+
+      print(
+        '================================================',
+      );
+
+      print(
+        'ROUTE ${i + 1}',
+      );
+
+      print(
+        'Rainfall: '
+        '${routeRainfall.toStringAsFixed(2)} mm',
+      );
+
+      print(
+        'Rainfall Risk: '
+        '${rainfallScore.toStringAsFixed(1)}',
+      );
+
+      print(
+        'Elevation Risk: '
+        '${elevationRisk.toStringAsFixed(1)}',
+      );
+
+      print(
+        'Distance Score: '
+        '${distanceScore.toStringAsFixed(1)}',
+      );
+
+      print(
+        'FINAL RISK SCORE: '
+        '${score.toStringAsFixed(1)}',
+      );
+
+      print(
+        '================================================',
+      );
+
+      if (score < lowestScore) {
+        lowestScore = score;
+        safestIndex = i;
+      }
+    }
+
+    // ==========================================================
+    // SAVE SCORES FOR UI
+    // ==========================================================
+
+    if (mounted) {
+      setState(() {
+        riskScores =
+            calculatedRiskScores;
+
+        elevationScores =
+            calculatedElevationScores;
+
+        routeRainfallScores =
+            calculatedRainfallScores;
+
+        // Show the safest route rainfall as the main rainfall.
+        if (calculatedRainfallScores.isNotEmpty) {
+          rainfall =
+              calculatedRainfallScores[safestIndex];
+        }
+      });
+    }
+
+    print(
+      'SAFEST ROUTE: Route ${safestIndex + 1}',
+    );
+
+    print(
+      'LOWEST RISK: '
+      '${lowestScore.toStringAsFixed(1)}',
+    );
+
+    return safestIndex;
+  }
+
+  // ============================================================
+  // GET STORED RISK SCORE
+  // ============================================================
+
+  double getRouteRiskScore(
+    int index,
+  ) {
+    if (index < 0 ||
+        index >= riskScores.length) {
+      return 0;
+    }
+
+    return riskScores[index];
+  }
+
+  // ============================================================
+  // GET STORED ELEVATION SCORE
+  // ============================================================
+
+  double getElevationScore(
+    int index,
+  ) {
+    if (index < 0 ||
+        index >= elevationScores.length) {
+      return 0;
+    }
+
+    return elevationScores[index];
+  }
+
+  // ============================================================
+  // GET ROUTE RAINFALL
+  // ============================================================
+
+  double getRouteRainfall(
+    int index,
+  ) {
+    if (index < 0 ||
+        index >= routeRainfallScores.length) {
+      return rainfall;
+    }
+
+    return routeRainfallScores[index];
+  }
+
+  // ============================================================
+  // RISK LEVEL
+  // ============================================================
+
+  RiskLevel routeRiskLevel(
+    int routeIndex,
+  ) {
+    final score =
+        getRouteRiskScore(routeIndex);
+
+    if (score >= 75) {
       return RiskLevel.impassable;
     }
 
-    if (score >= 35) {
+    if (score >= 45) {
       return RiskLevel.moderate;
     }
 
@@ -372,7 +776,9 @@ class _MapScreenState extends State<MapScreen> {
   // RISK COLOR
   // ============================================================
 
-  Color riskColor(RiskLevel level) {
+  Color riskColor(
+    RiskLevel level,
+  ) {
     switch (level) {
       case RiskLevel.safe:
         return Colors.green;
@@ -389,7 +795,9 @@ class _MapScreenState extends State<MapScreen> {
   // RISK TEXT
   // ============================================================
 
-  String riskText(RiskLevel level) {
+  String riskText(
+    RiskLevel level,
+  ) {
     switch (level) {
       case RiskLevel.safe:
         return 'SAFE';
@@ -403,47 +811,82 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // ============================================================
+  // RISK DESCRIPTION
+  // ============================================================
+
+  String riskDescription(
+    RiskLevel level,
+  ) {
+    switch (level) {
+      case RiskLevel.safe:
+        return 'Lower calculated flood susceptibility';
+
+      case RiskLevel.moderate:
+        return 'Moderate calculated flood susceptibility';
+
+      case RiskLevel.impassable:
+        return 'Higher calculated flood susceptibility';
+    }
+  }
+
+  // ============================================================
   // FIT MAP TO SELECTED ROUTE
   // ============================================================
 
-  void fitMapToRoute(RouteOption route) {
-    if (route.coordinates.isEmpty) return;
+  void fitMapToRoute(
+    RouteOption route,
+  ) {
+    if (route.coordinates.isEmpty) {
+      return;
+    }
 
-    double minLat = route.coordinates.first[0];
-    double maxLat = route.coordinates.first[0];
+    double minLat =
+        route.coordinates.first[0];
 
-    double minLng = route.coordinates.first[1];
-    double maxLng = route.coordinates.first[1];
+    double maxLat =
+        route.coordinates.first[0];
+
+    double minLng =
+        route.coordinates.first[1];
+
+    double maxLng =
+        route.coordinates.first[1];
 
     for (final point in route.coordinates) {
       final lat = point[0];
       final lng = point[1];
 
-      if (lat < minLat) minLat = lat;
-      if (lat > maxLat) maxLat = lat;
+      if (lat < minLat) {
+        minLat = lat;
+      }
 
-      if (lng < minLng) minLng = lng;
-      if (lng > maxLng) maxLng = lng;
+      if (lat > maxLat) {
+        maxLat = lat;
+      }
+
+      if (lng < minLng) {
+        minLng = lng;
+      }
+
+      if (lng > maxLng) {
+        maxLng = lng;
+      }
     }
 
     if (currentPosition != null) {
-      minLat = minLat <
-              currentPosition!.latitude
+      minLat = minLat < currentPosition!.latitude
           ? minLat
           : currentPosition!.latitude;
 
-      maxLat = maxLat >
-              currentPosition!.latitude
+      maxLat = maxLat > currentPosition!.latitude
           ? maxLat
           : currentPosition!.latitude;
 
-      minLng = minLng <
-              currentPosition!.longitude
+      minLng = minLng < currentPosition!.longitude
           ? minLng
           : currentPosition!.longitude;
 
-      maxLng = maxLng >
-              currentPosition!.longitude
+      maxLng = maxLng > currentPosition!.longitude
           ? maxLng
           : currentPosition!.longitude;
     }
@@ -471,8 +914,15 @@ class _MapScreenState extends State<MapScreen> {
       (minLng + maxLng) / 2,
     );
 
-    mapController.move(center, calculateZoom());
+    mapController.move(
+      center,
+      calculateZoom(),
+    );
   }
+
+  // ============================================================
+  // CALCULATE ZOOM
+  // ============================================================
 
   double calculateZoom() {
     if (currentPosition == null ||
@@ -480,7 +930,8 @@ class _MapScreenState extends State<MapScreen> {
       return 13;
     }
 
-    final distance = const Distance().as(
+    final distance =
+        const Distance().as(
       LengthUnit.Kilometer,
       LatLng(
         currentPosition!.latitude,
@@ -489,32 +940,50 @@ class _MapScreenState extends State<MapScreen> {
       destination!,
     );
 
-    if (distance < 2) return 15;
+    if (distance < 2) {
+      return 15;
+    }
 
-    if (distance < 5) return 14;
+    if (distance < 5) {
+      return 14;
+    }
 
-    if (distance < 10) return 13;
+    if (distance < 10) {
+      return 13;
+    }
 
-    if (distance < 20) return 12;
+    if (distance < 20) {
+      return 12;
+    }
 
     return 11;
   }
 
   // ============================================================
-  // SELECT A DIFFERENT ROUTE
+  // SELECT ROUTE
   // ============================================================
 
-  void selectRoute(int index) {
-    if (index < 0 || index >= routes.length) {
+  void selectRoute(
+    int index,
+  ) {
+    if (index < 0 ||
+        index >= routes.length) {
       return;
     }
 
     setState(() {
       selectedRouteIndex = index;
+
       safestRoute = routes[index];
+
+      // Update the main displayed rainfall
+      // when the user selects another route.
+      rainfall = getRouteRainfall(index);
     });
 
-    fitMapToRoute(routes[index]);
+    fitMapToRoute(
+      routes[index],
+    );
   }
 
   // ============================================================
@@ -552,7 +1021,9 @@ class _MapScreenState extends State<MapScreen> {
   // FORMAT DISTANCE
   // ============================================================
 
-  String formatDistance(double km) {
+  String formatDistance(
+    double km,
+  ) {
     if (km < 1) {
       return '${(km * 1000).round()} m';
     }
@@ -565,7 +1036,9 @@ class _MapScreenState extends State<MapScreen> {
   // ============================================================
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(
+    BuildContext context,
+  ) {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
@@ -587,15 +1060,17 @@ class _MapScreenState extends State<MapScreen> {
             mapController: mapController,
 
             options: MapOptions(
-              initialCenter:
-                  const LatLng(
+              initialCenter: const LatLng(
                 13.0827,
                 80.2707,
               ),
 
               initialZoom: 11.5,
 
-              onTap: (tapPosition, point) {
+              onTap: (
+                tapPosition,
+                point,
+              ) {
                 if (widget.selectionMode) {
                   selectDestination(point);
                 }
@@ -616,15 +1091,17 @@ class _MapScreenState extends State<MapScreen> {
               ),
 
               // ==================================================
-              // REAL ROUTES
+              // REAL ROAD ROUTES
               // ==================================================
 
               if (routes.isNotEmpty)
                 PolylineLayer(
                   polylines: [
-                    for (int i = 0;
-                        i < routes.length;
-                        i++)
+                    for (
+                      int i = 0;
+                      i < routes.length;
+                      i++
+                    )
                       Polyline(
                         points: routes[i]
                             .coordinates
@@ -638,17 +1115,16 @@ class _MapScreenState extends State<MapScreen> {
 
                         strokeWidth:
                             i == selectedRouteIndex
-                                ? 8
+                                ? 9
                                 : 5,
 
                         color:
-                            i == selectedRouteIndex
-                                ? Colors.blue
-                                : riskColor(
-                                    routeRiskLevel(
-                                      routes[i],
-                                    ),
-                                  ),
+                            riskScores.length ==
+                                    routes.length
+                                ? riskColor(
+                                    routeRiskLevel(i),
+                                  )
+                                : Colors.blue,
                       ),
                   ],
                 ),
@@ -660,13 +1136,12 @@ class _MapScreenState extends State<MapScreen> {
               MarkerLayer(
                 markers: [
                   // CURRENT LOCATION
+
                   if (currentPosition != null)
                     Marker(
                       point: LatLng(
-                        currentPosition!
-                            .latitude,
-                        currentPosition!
-                            .longitude,
+                        currentPosition!.latitude,
+                        currentPosition!.longitude,
                       ),
 
                       width: 55,
@@ -677,12 +1152,11 @@ class _MapScreenState extends State<MapScreen> {
                             BoxDecoration(
                           color: Colors.blue
                               .withOpacity(0.15),
-                          shape:
-                              BoxShape.circle,
+
+                          shape: BoxShape.circle,
                         ),
 
-                        child:
-                            const Icon(
+                        child: const Icon(
                           Icons.my_location,
                           color: Colors.blue,
                           size: 35,
@@ -691,6 +1165,7 @@ class _MapScreenState extends State<MapScreen> {
                     ),
 
                   // DESTINATION
+
                   if (destination != null)
                     Marker(
                       point: destination!,
@@ -738,7 +1213,9 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                     ),
 
-                    const SizedBox(width: 10),
+                    const SizedBox(
+                      width: 10,
+                    ),
 
                     Expanded(
                       child: Column(
@@ -756,8 +1233,7 @@ class _MapScreenState extends State<MapScreen> {
 
                           Text(
                             widget.travelMode,
-                            style:
-                                const TextStyle(
+                            style: const TextStyle(
                               fontSize: 16,
                               fontWeight:
                                   FontWeight.bold,
@@ -804,7 +1280,9 @@ class _MapScreenState extends State<MapScreen> {
                         ),
                       ),
 
-                      const SizedBox(height: 7),
+                      const SizedBox(
+                        height: 7,
+                      ),
 
                       Row(
                         children: [
@@ -814,7 +1292,9 @@ class _MapScreenState extends State<MapScreen> {
                             size: 18,
                           ),
 
-                          const SizedBox(width: 6),
+                          const SizedBox(
+                            width: 6,
+                          ),
 
                           Expanded(
                             child: Text(
@@ -822,6 +1302,7 @@ class _MapScreenState extends State<MapScreen> {
                                       null
                                   ? 'Current location: Detecting...'
                                   : 'Current location: Detected',
+
                               style:
                                   const TextStyle(
                                 fontSize: 12,
@@ -831,7 +1312,9 @@ class _MapScreenState extends State<MapScreen> {
                         ],
                       ),
 
-                      const SizedBox(height: 5),
+                      const SizedBox(
+                        height: 5,
+                      ),
 
                       Row(
                         children: [
@@ -841,13 +1324,17 @@ class _MapScreenState extends State<MapScreen> {
                             size: 18,
                           ),
 
-                          const SizedBox(width: 6),
+                          const SizedBox(
+                            width: 6,
+                          ),
 
                           Expanded(
                             child: Text(
-                              destination == null
+                              destination ==
+                                      null
                                   ? 'Tap anywhere on the map to choose destination'
                                   : 'Destination selected',
+
                               style:
                                   const TextStyle(
                                 fontSize: 12,
@@ -870,8 +1357,10 @@ class _MapScreenState extends State<MapScreen> {
             Positioned.fill(
               child: IgnorePointer(
                 child: Container(
-                  color: Colors.black
-                      .withOpacity(0.18),
+                  color:
+                      Colors.black.withOpacity(
+                    0.18,
+                  ),
 
                   child: Center(
                     child: Card(
@@ -892,22 +1381,27 @@ class _MapScreenState extends State<MapScreen> {
                           children: const [
                             CircularProgressIndicator(),
 
-                            SizedBox(height: 15),
+                            SizedBox(
+                              height: 15,
+                            ),
 
                             Text(
-                              'Finding safest routes...',
+                              'Analyzing safest routes...',
                               style: TextStyle(
                                 fontWeight:
                                     FontWeight.bold,
                               ),
                             ),
 
-                            SizedBox(height: 5),
+                            SizedBox(
+                              height: 5,
+                            ),
 
                             Text(
-                              'Analyzing real road paths',
+                              'Checking live rainfall, elevation and distance',
                               style: TextStyle(
-                                color: Colors.grey,
+                                color:
+                                    Colors.grey,
                                 fontSize: 12,
                               ),
                             ),
@@ -931,10 +1425,9 @@ class _MapScreenState extends State<MapScreen> {
                 widget.selectionMode &&
                         !routeCalculated
                     ? 150
-                    : 310,
+                    : 350,
 
-            child:
-                FloatingActionButton(
+            child: FloatingActionButton(
               heroTag:
                   'hydropulse_my_location',
 
@@ -954,6 +1447,7 @@ class _MapScreenState extends State<MapScreen> {
                       ? const SizedBox(
                           width: 23,
                           height: 23,
+
                           child:
                               CircularProgressIndicator(
                             strokeWidth: 2.5,
@@ -980,8 +1474,7 @@ class _MapScreenState extends State<MapScreen> {
               child: SizedBox(
                 height: 55,
 
-                child:
-                    ElevatedButton.icon(
+                child: ElevatedButton.icon(
                   onPressed:
                       findSafestRoute,
 
@@ -1008,21 +1501,20 @@ class _MapScreenState extends State<MapScreen> {
           if (routeCalculated &&
               safestRoute != null)
             Positioned(
-              left: 12,
-              right: 12,
-              bottom: 15,
+              left: 10,
+              right: 10,
+              bottom: 10,
 
               child: Card(
-                elevation: 9,
+                elevation: 10,
 
                 child: Padding(
                   padding:
-                      const EdgeInsets.all(15),
+                      const EdgeInsets.all(14),
 
                   child: Column(
                     crossAxisAlignment:
-                        CrossAxisAlignment
-                            .start,
+                        CrossAxisAlignment.start,
 
                     children: [
                       // ------------------------------------------
@@ -1032,25 +1524,32 @@ class _MapScreenState extends State<MapScreen> {
                       Row(
                         children: [
                           Container(
-                            width: 43,
-                            height: 43,
+                            width: 45,
+                            height: 45,
 
                             decoration:
                                 BoxDecoration(
-                              color: Colors.green
-                                  .withOpacity(
-                                      0.12),
+                              color:
+                                  riskColor(
+                                routeRiskLevel(
+                                  selectedRouteIndex,
+                                ),
+                              ).withOpacity(
+                                0.12,
+                              ),
 
                               shape:
                                   BoxShape.circle,
                             ),
 
-                            child:
-                                const Icon(
-                              Icons
-                                  .verified_user,
+                            child: Icon(
+                              Icons.shield,
                               color:
-                                  Colors.green,
+                                  riskColor(
+                                routeRiskLevel(
+                                  selectedRouteIndex,
+                                ),
+                              ),
                             ),
                           ),
 
@@ -1058,85 +1557,129 @@ class _MapScreenState extends State<MapScreen> {
                             width: 10,
                           ),
 
-                          const Expanded(
-                            child: Text(
-                              'Safest Route Found',
-                              style:
-                                  TextStyle(
-                                fontSize: 17,
-                                fontWeight:
-                                    FontWeight
-                                        .bold,
-                              ),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment:
+                                  CrossAxisAlignment
+                                      .start,
+
+                              children: [
+                                const Text(
+                                  'Safest Route Found',
+                                  style: TextStyle(
+                                    fontSize: 17,
+                                    fontWeight:
+                                        FontWeight
+                                            .bold,
+                                  ),
+                                ),
+
+                                const SizedBox(
+                                  height: 2,
+                                ),
+
+                                Text(
+                                  'Lowest calculated risk among ${routes.length} route${routes.length == 1 ? '' : 's'}',
+
+                                  style:
+                                      const TextStyle(
+                                    color:
+                                        Colors.grey,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ],
                       ),
 
-                      const SizedBox(height: 10),
-
-                      // ------------------------------------------
-                      // ROUTE NUMBER
-                      // ------------------------------------------
-
-                      Text(
-                        'Route ${selectedRouteIndex + 1}',
-                        style:
-                            const TextStyle(
-                          fontSize: 18,
-                          fontWeight:
-                              FontWeight.bold,
-                        ),
+                      const SizedBox(
+                        height: 10,
                       ),
 
-                      const SizedBox(height: 7),
-
                       // ------------------------------------------
-                      // RISK
+                      // ROUTE + RISK
                       // ------------------------------------------
 
                       Row(
                         children: [
-                          Icon(
-                            Icons.shield,
-                            size: 18,
-                            color:
-                                riskColor(
-                              routeRiskLevel(
-                                safestRoute!,
-                              ),
+                          Text(
+                            'Route ${selectedRouteIndex + 1}',
+
+                            style:
+                                const TextStyle(
+                              fontSize: 19,
+                              fontWeight:
+                                  FontWeight.bold,
                             ),
                           ),
 
                           const SizedBox(
-                            width: 5,
+                            width: 10,
                           ),
 
-                          Text(
-                            riskText(
-                              routeRiskLevel(
-                                safestRoute!,
-                              ),
-                            ),
+                          Builder(
+                            builder:
+                                (context) {
+                              final risk =
+                                  routeRiskLevel(
+                                selectedRouteIndex,
+                              );
 
-                            style:
-                                TextStyle(
-                              fontWeight:
-                                  FontWeight
-                                      .bold,
-                              color:
-                                  riskColor(
-                                routeRiskLevel(
-                                  safestRoute!,
+                              return Container(
+                                padding:
+                                    const EdgeInsets
+                                        .symmetric(
+                                  horizontal: 9,
+                                  vertical: 5,
                                 ),
-                              ),
-                            ),
+
+                                decoration:
+                                    BoxDecoration(
+                                  color:
+                                      riskColor(
+                                    risk,
+                                  ).withOpacity(
+                                    0.12,
+                                  ),
+
+                                  borderRadius:
+                                      BorderRadius
+                                          .circular(
+                                    20,
+                                  ),
+                                ),
+
+                                child: Text(
+                                  riskText(
+                                    risk,
+                                  ),
+
+                                  style:
+                                      TextStyle(
+                                    color:
+                                        riskColor(
+                                      risk,
+                                    ),
+
+                                    fontWeight:
+                                        FontWeight
+                                            .bold,
+
+                                    fontSize:
+                                        11,
+                                  ),
+                                ),
+                              );
+                            },
                           ),
 
                           const Spacer(),
 
                           Text(
                             widget.travelMode,
+
                             style:
                                 const TextStyle(
                               color:
@@ -1147,12 +1690,50 @@ class _MapScreenState extends State<MapScreen> {
                         ],
                       ),
 
+                      const SizedBox(
+                        height: 7,
+                      ),
+
+                      // ------------------------------------------
+                      // RISK DESCRIPTION
+                      // ------------------------------------------
+
+                      Builder(
+                        builder:
+                            (context) {
+                          final risk =
+                              routeRiskLevel(
+                            selectedRouteIndex,
+                          );
+
+                          return Text(
+                            riskDescription(
+                              risk,
+                            ),
+
+                            style:
+                                TextStyle(
+                              color:
+                                  riskColor(
+                                risk,
+                              ),
+
+                              fontSize: 12,
+
+                              fontWeight:
+                                  FontWeight
+                                      .w600,
+                            ),
+                          );
+                        },
+                      ),
+
                       const Divider(
                         height: 20,
                       ),
 
                       // ------------------------------------------
-                      // DISTANCE / TIME
+                      // INFORMATION
                       // ------------------------------------------
 
                       Row(
@@ -1161,8 +1742,7 @@ class _MapScreenState extends State<MapScreen> {
                             child:
                                 _RiskInfo(
                               icon:
-                                  Icons
-                                      .route,
+                                  Icons.route,
                               title:
                                   'Distance',
                               value:
@@ -1177,8 +1757,7 @@ class _MapScreenState extends State<MapScreen> {
                             child:
                                 _RiskInfo(
                               icon:
-                                  Icons
-                                      .access_time,
+                                  Icons.access_time,
                               title:
                                   'ETA',
                               value:
@@ -1190,21 +1769,98 @@ class _MapScreenState extends State<MapScreen> {
                             child:
                                 _RiskInfo(
                               icon:
-                                  Icons
-                                      .water_drop,
+                                  Icons.water_drop,
                               title:
                                   'Rainfall',
                               value:
-                                  '${rainfall.toStringAsFixed(1)} mm',
+                                  '${getRouteRainfall(selectedRouteIndex).toStringAsFixed(1)} mm',
                             ),
                           ),
                         ],
                       ),
 
-                      const SizedBox(height: 12),
+                      const SizedBox(
+                        height: 10,
+                      ),
 
                       // ------------------------------------------
-                      // ALTERNATIVE ROUTES
+                      // RISK SCORE + ELEVATION
+                      // ------------------------------------------
+
+                      Container(
+                        padding:
+                            const EdgeInsets
+                                .all(10),
+
+                        decoration:
+                            BoxDecoration(
+                          color: Colors.grey
+                              .withOpacity(
+                            0.07,
+                          ),
+
+                          borderRadius:
+                              BorderRadius
+                                  .circular(
+                            10,
+                          ),
+
+                          border: Border.all(
+                            color: Colors
+                                .grey.shade300,
+                          ),
+                        ),
+
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child:
+                                  _RiskInfo(
+                                icon:
+                                    Icons.analytics,
+                                title:
+                                    'Risk Score',
+                                value:
+                                    getRouteRiskScore(
+                                  selectedRouteIndex,
+                                ).toStringAsFixed(
+                                  1,
+                                ),
+                              ),
+                            ),
+
+                            Expanded(
+                              child:
+                                  _RiskInfo(
+                                icon:
+                                    Icons.terrain,
+                                title:
+                                    'Elevation Risk',
+                                value:
+                                    '${getElevationScore(selectedRouteIndex).toStringAsFixed(1)} / 40',
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+
+                      const SizedBox(
+                        height: 5,
+                      ),
+
+                      const Text(
+                        'Rainfall is sampled along the route. Elevation is one risk component and does not by itself confirm flooding or waterlogging.',
+
+                        style:
+                            TextStyle(
+                          color:
+                              Colors.grey,
+                          fontSize: 9,
+                        ),
+                      ),
+
+                      // ------------------------------------------
+                      // AVAILABLE ROUTES
                       // ------------------------------------------
 
                       if (routes.length > 1)
@@ -1214,12 +1870,18 @@ class _MapScreenState extends State<MapScreen> {
                                   .start,
 
                           children: [
+                            const SizedBox(
+                              height: 12,
+                            ),
+
                             const Text(
-                              'Available Routes',
+                              'Alternative Routes',
+
                               style:
                                   TextStyle(
                                 fontWeight:
-                                    FontWeight.bold,
+                                    FontWeight
+                                        .bold,
                                 fontSize: 13,
                               ),
                             ),
@@ -1229,7 +1891,7 @@ class _MapScreenState extends State<MapScreen> {
                             ),
 
                             SizedBox(
-                              height: 48,
+                              height: 78,
 
                               child:
                                   ListView
@@ -1243,21 +1905,36 @@ class _MapScreenState extends State<MapScreen> {
                                         .length,
 
                                 separatorBuilder:
-                                    (_, __) =>
+                                    (
+                                  _,
+                                  __,
+                                ) =>
                                         const SizedBox(
                                   width: 7,
                                 ),
 
                                 itemBuilder:
-                                    (context,
-                                        index) {
+                                    (
+                                  context,
+                                  index,
+                                ) {
                                   final route =
                                       routes[
                                           index];
 
                                   final risk =
                                       routeRiskLevel(
-                                    route,
+                                    index,
+                                  );
+
+                                  final score =
+                                      getRouteRiskScore(
+                                    index,
+                                  );
+
+                                  final routeRain =
+                                      getRouteRainfall(
+                                    index,
                                   );
 
                                   final selected =
@@ -1265,113 +1942,238 @@ class _MapScreenState extends State<MapScreen> {
                                           selectedRouteIndex;
 
                                   return GestureDetector(
-                                    onTap: () =>
-                                        selectRoute(
+                                    onTap:
+                                        () =>
+                                            selectRoute(
                                       index,
                                     ),
 
                                     child:
                                         Container(
+                                      width:
+                                          165,
+
                                       padding:
                                           const EdgeInsets
-                                              .symmetric(
-                                        horizontal:
-                                            12,
+                                              .all(
+                                        8,
                                       ),
 
                                       decoration:
                                           BoxDecoration(
-                                        color: selected
-                                            ? Colors
-                                                .blue
-                                                .withOpacity(
-                                                    0.10)
-                                            : Colors
-                                                .grey
-                                                .withOpacity(
-                                                    0.08),
+                                        color:
+                                            selected
+                                                ? riskColor(
+                                                    risk,
+                                                  ).withOpacity(
+                                                    0.10,
+                                                  )
+                                                : Colors
+                                                    .grey
+                                                    .withOpacity(
+                                                    0.06,
+                                                  ),
 
                                         borderRadius:
                                             BorderRadius
                                                 .circular(
-                                                    12),
+                                          12,
+                                        ),
 
                                         border:
                                             Border.all(
                                           color:
                                               selected
-                                                  ? Colors
-                                                      .blue
+                                                  ? riskColor(
+                                                      risk,
+                                                    )
                                                   : Colors
                                                       .grey
                                                       .shade300,
+
+                                          width:
+                                              selected
+                                                  ? 1.5
+                                                  : 1,
                                         ),
                                       ),
 
                                       child:
-                                          Row(
+                                          Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment
+                                                .start,
+
                                         children: [
-                                          Icon(
-                                            selected
-                                                ? Icons
-                                                    .radio_button_checked
-                                                : Icons
-                                                    .radio_button_off,
-                                            color:
+                                          Row(
+                                            children: [
+                                              Icon(
                                                 selected
-                                                    ? Colors
-                                                        .blue
-                                                    : Colors
-                                                        .grey,
-                                            size: 18,
+                                                    ? Icons
+                                                        .radio_button_checked
+                                                    : Icons
+                                                        .radio_button_off,
+
+                                                color:
+                                                    selected
+                                                        ? riskColor(
+                                                            risk,
+                                                          )
+                                                        : Colors
+                                                            .grey,
+
+                                                size:
+                                                    16,
+                                              ),
+
+                                              const SizedBox(
+                                                width:
+                                                    4,
+                                              ),
+
+                                              Text(
+                                                'Route ${index + 1}',
+
+                                                style:
+                                                    const TextStyle(
+                                                  fontWeight:
+                                                      FontWeight
+                                                          .bold,
+                                                  fontSize:
+                                                      12,
+                                                ),
+                                              ),
+
+                                              const Spacer(),
+
+                                              Icon(
+                                                Icons
+                                                    .shield,
+
+                                                size:
+                                                    15,
+
+                                                color:
+                                                    riskColor(
+                                                  risk,
+                                                ),
+                                              ),
+                                            ],
                                           ),
 
                                           const SizedBox(
-                                            width:
-                                                5,
+                                            height:
+                                                4,
                                           ),
 
-                                          Text(
-                                            'R${index + 1}',
-                                            style:
-                                                const TextStyle(
-                                              fontWeight:
-                                                  FontWeight
-                                                      .bold,
-                                            ),
+                                          Row(
+                                            children: [
+                                              Text(
+                                                formatDistance(
+                                                  route
+                                                      .distanceKm,
+                                                ),
+
+                                                style:
+                                                    const TextStyle(
+                                                  fontSize:
+                                                      10,
+                                                ),
+                                              ),
+
+                                              const SizedBox(
+                                                width:
+                                                    6,
+                                              ),
+
+                                              Text(
+                                                '${route.durationMinutes} min',
+
+                                                style:
+                                                    const TextStyle(
+                                                  fontSize:
+                                                      10,
+                                                  color:
+                                                      Colors.grey,
+                                                ),
+                                              ),
+                                            ],
                                           ),
 
                                           const SizedBox(
-                                            width:
-                                                6,
+                                            height:
+                                                3,
                                           ),
 
-                                          Text(
-                                            formatDistance(
-                                              route
-                                                  .distanceKm,
-                                            ),
-                                            style:
-                                                const TextStyle(
-                                              fontSize:
-                                                  11,
-                                            ),
-                                          ),
+                                          Row(
+                                            children: [
+                                              Icon(
+                                                Icons
+                                                    .water_drop,
+                                                size:
+                                                    11,
+                                                color:
+                                                    Colors.blue,
+                                              ),
 
-                                          const SizedBox(
-                                            width:
-                                                6,
-                                          ),
+                                              const SizedBox(
+                                                width:
+                                                    2,
+                                              ),
 
-                                          Icon(
-                                            Icons
-                                                .shield,
-                                            size:
-                                                14,
-                                            color:
-                                                riskColor(
-                                              risk,
-                                            ),
+                                              Text(
+                                                '${routeRain.toStringAsFixed(1)} mm',
+
+                                                style:
+                                                    const TextStyle(
+                                                  fontSize:
+                                                      9,
+                                                  color:
+                                                      Colors.blue,
+                                                ),
+                                              ),
+
+                                              const SizedBox(
+                                                width:
+                                                    5,
+                                              ),
+
+                                              Text(
+                                                riskText(
+                                                  risk,
+                                                ),
+
+                                                style:
+                                                    TextStyle(
+                                                  color:
+                                                      riskColor(
+                                                    risk,
+                                                  ),
+
+                                                  fontWeight:
+                                                      FontWeight
+                                                          .bold,
+
+                                                  fontSize:
+                                                      9,
+                                                ),
+                                              ),
+
+                                              const Spacer(),
+
+                                              Text(
+                                                'Score ${score.toStringAsFixed(0)}',
+
+                                                style:
+                                                    const TextStyle(
+                                                  fontSize:
+                                                      9,
+
+                                                  color:
+                                                      Colors.grey,
+                                                ),
+                                              ),
+                                            ],
                                           ),
                                         ],
                                       ),
@@ -1389,7 +2191,7 @@ class _MapScreenState extends State<MapScreen> {
             ),
 
           // ======================================================
-          // ERROR
+          // LOCATION ERROR
           // ======================================================
 
           if (locationError.isNotEmpty)
@@ -1399,11 +2201,14 @@ class _MapScreenState extends State<MapScreen> {
               bottom: 90,
 
               child: Card(
-                color: Colors.red.shade50,
+                color:
+                    Colors.red.shade50,
 
                 child: Padding(
                   padding:
-                      const EdgeInsets.all(10),
+                      const EdgeInsets.all(
+                    10,
+                  ),
 
                   child: Row(
                     children: [
@@ -1419,6 +2224,7 @@ class _MapScreenState extends State<MapScreen> {
                       Expanded(
                         child: Text(
                           locationError,
+
                           style:
                               const TextStyle(
                             color: Colors.red,
@@ -1444,17 +2250,19 @@ class _MapScreenState extends State<MapScreen> {
               bottom: 90,
 
               child: Card(
-                color: Colors.red.shade50,
+                color:
+                    Colors.red.shade50,
 
                 child: Padding(
                   padding:
-                      const EdgeInsets.all(10),
+                      const EdgeInsets.all(
+                    10,
+                  ),
 
                   child: Row(
                     children: [
                       const Icon(
-                        Icons
-                            .wrong_location,
+                        Icons.wrong_location,
                         color: Colors.red,
                       ),
 
@@ -1465,6 +2273,7 @@ class _MapScreenState extends State<MapScreen> {
                       Expanded(
                         child: Text(
                           routeError,
+
                           style:
                               const TextStyle(
                             color: Colors.red,
@@ -1487,7 +2296,8 @@ class _MapScreenState extends State<MapScreen> {
 // RISK INFORMATION WIDGET
 // ================================================================
 
-class _RiskInfo extends StatelessWidget {
+class _RiskInfo
+    extends StatelessWidget {
   final IconData icon;
 
   final String title;
@@ -1501,7 +2311,9 @@ class _RiskInfo extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(
+    BuildContext context,
+  ) {
     return Column(
       children: [
         Icon(
@@ -1510,22 +2322,31 @@ class _RiskInfo extends StatelessWidget {
           size: 20,
         ),
 
-        const SizedBox(height: 4),
+        const SizedBox(
+          height: 4,
+        ),
 
         Text(
           title,
-          style: const TextStyle(
+
+          style:
+              const TextStyle(
             color: Colors.grey,
             fontSize: 10,
           ),
         ),
 
-        const SizedBox(height: 2),
+        const SizedBox(
+          height: 2,
+        ),
 
         Text(
           value,
-          style: const TextStyle(
-            fontWeight: FontWeight.bold,
+
+          style:
+              const TextStyle(
+            fontWeight:
+                FontWeight.bold,
             fontSize: 12,
           ),
         ),
