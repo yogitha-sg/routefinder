@@ -1,378 +1,219 @@
+
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:http/http.dart' as http;
+
+class RouteStep {
+  final String instruction;
+  final String formattedDistance;
+
+  RouteStep({
+    required this.instruction,
+    required this.formattedDistance,
+  });
+
+  factory RouteStep.fromJson(Map<String, dynamic> json) {
+    final distance = (json['distance'] ?? 0).toDouble();
+
+    return RouteStep(
+      instruction: _getInstruction(json),
+      formattedDistance: _formatDistance(distance),
+    );
+  }
+
+  static String _getInstruction(Map<String, dynamic> json) {
+    // OSRM normally provides a "maneuver" object.
+    final maneuver = json['maneuver'];
+
+    if (maneuver is Map<String, dynamic>) {
+      final type = maneuver['type']?.toString() ?? '';
+      final modifier = maneuver['modifier']?.toString() ?? '';
+
+      if (type == 'depart') {
+        return 'Start your journey';
+      }
+
+      if (type == 'arrive') {
+        return 'You have arrived at your destination';
+      }
+
+      if (type == 'turn') {
+        if (modifier.isNotEmpty) {
+          return 'Turn $modifier';
+        }
+
+        return 'Turn';
+      }
+
+      if (type == 'new name') {
+        return 'Continue';
+      }
+
+      if (type == 'roundabout') {
+        return 'Enter the roundabout';
+      }
+
+      if (type == 'merge') {
+        return 'Merge';
+      }
+
+      if (type == 'fork') {
+        if (modifier.isNotEmpty) {
+          return 'Keep $modifier at the fork';
+        }
+
+        return 'Keep at the fork';
+      }
+
+      if (type == 'continue') {
+        return 'Continue straight';
+      }
+
+      if (type == 'on ramp') {
+        return 'Take the ramp';
+      }
+
+      if (type == 'off ramp') {
+        return 'Take the exit ramp';
+      }
+
+      if (type == 'exit roundabout') {
+        return 'Exit the roundabout';
+      }
+
+      if (type == 'notification') {
+        return 'Continue';
+      }
+    }
+
+    return 'Continue on this road';
+  }
+
+  static String _formatDistance(double meters) {
+    if (meters < 1000) {
+      return '${meters.round()} m';
+    }
+
+    return '${(meters / 1000).toStringAsFixed(1)} km';
+  }
+}
 
 class RouteOption {
   final List<List<double>> coordinates;
   final double distanceMeters;
   final double durationSeconds;
+  final List<RouteStep> steps;
 
   RouteOption({
     required this.coordinates,
     required this.distanceMeters,
     required this.durationSeconds,
+    required this.steps,
   });
 
   double get distanceKm => distanceMeters / 1000;
 
-  int get durationMinutes => (durationSeconds / 60).round();
+  factory RouteOption.fromJson(Map<String, dynamic> json) {
+    final geometry = json['geometry'];
+
+    final List<List<double>> coordinates = [];
+
+    if (geometry is Map<String, dynamic>) {
+      final geometryCoordinates = geometry['coordinates'];
+
+      if (geometryCoordinates is List) {
+        for (final point in geometryCoordinates) {
+          if (point is List && point.length >= 2) {
+            final longitude = (point[0] as num).toDouble();
+            final latitude = (point[1] as num).toDouble();
+
+            coordinates.add([
+              latitude,
+              longitude,
+            ]);
+          }
+        }
+      }
+    }
+
+    final List<RouteStep> steps = [];
+
+    final legs = json['legs'];
+
+    if (legs is List) {
+      for (final leg in legs) {
+        if (leg is Map<String, dynamic>) {
+          final legSteps = leg['steps'];
+
+          if (legSteps is List) {
+            for (final step in legSteps) {
+              if (step is Map<String, dynamic>) {
+                steps.add(
+                  RouteStep.fromJson(step),
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return RouteOption(
+      coordinates: coordinates,
+      distanceMeters: (json['distance'] ?? 0).toDouble(),
+      durationSeconds: (json['duration'] ?? 0).toDouble(),
+      steps: steps,
+    );
+  }
 }
 
 class RouteService {
-  static const String _baseUrl =
-      'https://router.project-osrm.org';
-
-  // ------------------------------------------------------------
-  // PUBLIC METHOD
-  // ------------------------------------------------------------
+  static const String _baseUrl = 'https://router.project-osrm.org/route/v1/driving';
 
   static Future<List<RouteOption>> getRoutes({
-    required double startLat,
-    required double startLng,
-    required double endLat,
-    required double endLng,
-  }) async {
-    print('------------------------------------------');
-    print('HYDROPULSE ROUTING');
-    print('Start: $startLat, $startLng');
-    print('End:   $endLat, $endLng');
-    print('------------------------------------------');
-
-    // First try OSRM's own alternatives.
-    final normalRoutes = await _getOsrmRoutes(
-      startLat: startLat,
-      startLng: startLng,
-      endLat: endLat,
-      endLng: endLng,
-      alternatives: true,
-    );
-
-    print(
-      'OSRM normal routes received: ${normalRoutes.length}',
-    );
-
-    // If OSRM already gives 3 routes, use them.
-    if (normalRoutes.length >= 3) {
-      return normalRoutes.take(3).toList();
-    }
-
-    // Start with whatever OSRM gave us.
-    final List<RouteOption> allRoutes = [
-      ...normalRoutes,
-    ];
-
-    // ----------------------------------------------------------
-    // FALLBACK
-    //
-    // OSRM may return only one route.
-    // We then create different waypoint-based journeys.
-    // The routing is still performed by OSRM, so the paths
-    // follow actual roads.
-    // ----------------------------------------------------------
-
-    final fallbackWaypoints = _createWaypointCandidates(
-      startLat,
-      startLng,
-      endLat,
-      endLng,
-    );
-
-    for (final waypoint in fallbackWaypoints) {
-      if (allRoutes.length >= 3) {
-        break;
-      }
-
-      try {
-        final waypointRoutes = await _getRouteThroughWaypoint(
-          startLat: startLat,
-          startLng: startLng,
-          waypointLat: waypoint[0],
-          waypointLng: waypoint[1],
-          endLat: endLat,
-          endLng: endLng,
-        );
-
-        for (final route in waypointRoutes) {
-          if (_isDifferentRoute(route, allRoutes)) {
-            allRoutes.add(route);
-
-            print(
-              'Added fallback route ${allRoutes.length}: '
-              '${route.distanceKm.toStringAsFixed(2)} km',
-            );
-          }
-
-          if (allRoutes.length >= 3) {
-            break;
-          }
-        }
-      } catch (e) {
-        print(
-          'Waypoint route failed: $e',
-        );
-      }
-    }
-
-    print(
-      'FINAL ROUTES RETURNED: ${allRoutes.length}',
-    );
-
-    for (int i = 0; i < allRoutes.length; i++) {
-      print(
-        'Route ${i + 1}: '
-        '${allRoutes[i].distanceKm.toStringAsFixed(2)} km, '
-        '${allRoutes[i].durationMinutes} min',
-      );
-    }
-
-    print('------------------------------------------');
-
-    return allRoutes.take(3).toList();
-  }
-
-  // ------------------------------------------------------------
-  // NORMAL OSRM ROUTING
-  // ------------------------------------------------------------
-
-  static Future<List<RouteOption>> _getOsrmRoutes({
-    required double startLat,
-    required double startLng,
-    required double endLat,
-    required double endLng,
-    bool alternatives = false,
+    required double startLatitude,
+    required double startLongitude,
+    required double destinationLatitude,
+    required double destinationLongitude,
   }) async {
     final url = Uri.parse(
-      '$_baseUrl/route/v1/driving/'
-      '$startLng,$startLat;'
-      '$endLng,$endLat'
-      '?alternatives=$alternatives'
+      '$_baseUrl/'
+      '$startLongitude,$startLatitude;'
+      '$destinationLongitude,$destinationLatitude'
+      '?overview=full'
+      '&geometries=geojson'
       '&steps=true'
-      '&overview=full'
-      '&geometries=geojson',
+      '&alternatives=true',
     );
 
-    print('OSRM URL: $url');
-
-    final response = await http.get(
-      url,
-      headers: {
-        'Accept': 'application/json',
-      },
-    );
+    final response = await http.get(url);
 
     if (response.statusCode != 200) {
       throw Exception(
-        'Routing service failed: ${response.statusCode}',
+        'Failed to get routes. Status code: ${response.statusCode}',
       );
     }
 
-    final data = jsonDecode(response.body);
+    final Map<String, dynamic> data =
+        jsonDecode(response.body) as Map<String, dynamic>;
 
     if (data['code'] != 'Ok') {
       throw Exception(
-        'No route found: ${data['code']}',
+        'Routing service error: ${data['message'] ?? data['code']}',
       );
     }
 
-    final routes = data['routes'] as List;
+    final routes = data['routes'];
 
-    return routes.map<RouteOption>((route) {
-      final geometry = route['geometry'];
-
-      final rawCoordinates =
-          geometry['coordinates'] as List;
-
-      final coordinates =
-          rawCoordinates.map<List<double>>((point) {
-        return [
-          (point[1] as num).toDouble(),
-          (point[0] as num).toDouble(),
-        ];
-      }).toList();
-
-      return RouteOption(
-        coordinates: coordinates,
-        distanceMeters:
-            (route['distance'] as num).toDouble(),
-        durationSeconds:
-            (route['duration'] as num).toDouble(),
-      );
-    }).toList();
-  }
-
-  // ------------------------------------------------------------
-  // ROUTE THROUGH A WAYPOINT
-  // ------------------------------------------------------------
-
-  static Future<List<RouteOption>>
-      _getRouteThroughWaypoint({
-    required double startLat,
-    required double startLng,
-    required double waypointLat,
-    required double waypointLng,
-    required double endLat,
-    required double endLng,
-  }) async {
-    final url = Uri.parse(
-      '$_baseUrl/route/v1/driving/'
-      '$startLng,$startLat;'
-      '$waypointLng,$waypointLat;'
-      '$endLng,$endLat'
-      '?alternatives=false'
-      '&steps=true'
-      '&overview=full'
-      '&geometries=geojson',
-    );
-
-    final response = await http.get(
-      url,
-      headers: {
-        'Accept': 'application/json',
-      },
-    );
-
-    if (response.statusCode != 200) {
-      throw Exception(
-        'Waypoint routing failed: ${response.statusCode}',
-      );
+    if (routes is! List || routes.isEmpty) {
+      throw Exception('No routes found.');
     }
 
-    final data = jsonDecode(response.body);
-
-    if (data['code'] != 'Ok') {
-      throw Exception(
-        'Waypoint route unavailable',
-      );
-    }
-
-    final routes = data['routes'] as List;
-
-    return routes.map<RouteOption>((route) {
-      final geometry = route['geometry'];
-
-      final rawCoordinates =
-          geometry['coordinates'] as List;
-
-      final coordinates =
-          rawCoordinates.map<List<double>>((point) {
-        return [
-          (point[1] as num).toDouble(),
-          (point[0] as num).toDouble(),
-        ];
-      }).toList();
-
-      return RouteOption(
-        coordinates: coordinates,
-        distanceMeters:
-            (route['distance'] as num).toDouble(),
-        durationSeconds:
-            (route['duration'] as num).toDouble(),
-      );
-    }).toList();
-  }
-
-  // ------------------------------------------------------------
-  // CREATE DIFFERENT WAYPOINTS
-  // ------------------------------------------------------------
-
-  static List<List<double>> _createWaypointCandidates(
-    double startLat,
-    double startLng,
-    double endLat,
-    double endLng,
-  ) {
-    final midLat =
-        (startLat + endLat) / 2;
-
-    final midLng =
-        (startLng + endLng) / 2;
-
-    final deltaLat =
-        endLat - startLat;
-
-    final deltaLng =
-        endLng - startLng;
-
-    final length =
-        sqrt(
-          deltaLat * deltaLat +
-              deltaLng * deltaLng,
-        );
-
-    // Avoid division by zero.
-    if (length == 0) {
-      return [];
-    }
-
-    // Perpendicular direction.
-    final perpLat =
-        -deltaLng / length;
-
-    final perpLng =
-        deltaLat / length;
-
-    // Scale based on trip length.
-    final offset =
-        max(
-          0.0015,
-          min(
-            0.01,
-            length * 0.35,
-          ),
-        );
-
-    return [
-      [
-        midLat + perpLat * offset,
-        midLng + perpLng * offset,
-      ],
-      [
-        midLat - perpLat * offset,
-        midLng - perpLng * offset,
-      ],
-      [
-        midLat + perpLat * offset * 1.5,
-        midLng + perpLng * offset * 1.5,
-      ],
-      [
-        midLat - perpLat * offset * 1.5,
-        midLng - perpLng * offset * 1.5,
-      ],
-    ];
-  }
-
-  // ------------------------------------------------------------
-  // REMOVE DUPLICATE ROUTES
-  // ------------------------------------------------------------
-
-  static bool _isDifferentRoute(
-    RouteOption newRoute,
-    List<RouteOption> existingRoutes,
-  ) {
-    for (final existing in existingRoutes) {
-      final distanceDifference =
-          (newRoute.distanceMeters -
-                  existing.distanceMeters)
-              .abs();
-
-      final percentageDifference =
-          distanceDifference /
-              max(
-                existing.distanceMeters,
-                1,
-              );
-
-      // If the distances are extremely close,
-      // treat them as probably the same route.
-      if (percentageDifference < 0.03) {
-        continue;
-      }
-
-      // Distance differs enough.
-      return true;
-    }
-
-    return existingRoutes.isEmpty;
+    return routes
+        .whereType<Map<String, dynamic>>()
+        .map(
+          (route) => RouteOption.fromJson(route),
+        )
+        .toList();
   }
 }

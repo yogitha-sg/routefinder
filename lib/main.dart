@@ -1,7 +1,14 @@
 import 'package:flutter/material.dart';
-import 'screens/home_screen.dart';
 
-void main() {
+import 'screens/home_screen.dart';
+import 'services/voice_service.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize voice / text-to-speech
+  await VoiceService.instance.init();
+
   runApp(const HydroPulseApp());
 }
 
