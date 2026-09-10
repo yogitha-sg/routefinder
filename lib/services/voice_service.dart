@@ -56,9 +56,7 @@ class VoiceService {
   }
 
   // Enable / disable voice
-  Future<void> setEnabled(
-    bool value,
-  ) async {
+  Future<void> setEnabled(bool value) async {
     _enabled = value;
 
     if (!value) {
@@ -69,8 +67,7 @@ class VoiceService {
   // Check whether TTS is available
   Future<bool> isAvailable() async {
     try {
-      final result =
-          await _tts.isLanguageAvailable('en-IN');
+      final result = await _tts.isLanguageAvailable('en-IN');
 
       return result == 1 || result == 0;
     } catch (e) {
